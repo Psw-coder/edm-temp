@@ -1,12 +1,14 @@
 import argparse
+import json
 import os
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
 from scipy import sparse
 from scipy.sparse.linalg import eigsh
+from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 from sklearn.neighbors import NearestNeighbors
 
 try:
@@ -161,6 +163,65 @@ def run_umap(
         random_state=random_seed,
     )
     return reducer.fit_transform(features).astype(np.float32)
+
+
+def compute_knn_label_consistency(features: np.ndarray, labels: np.ndarray, k: int) -> float:
+    n_samples = features.shape[0]
+    if n_samples < 2:
+        return float("nan")
+
+    k_eff = max(1, min(k, n_samples - 1))
+    knn = NearestNeighbors(n_neighbors=k_eff + 1, metric="euclidean")
+    knn.fit(features)
+    neighbor_idx = knn.kneighbors(return_distance=False)[:, 1:]
+    neighbor_labels = labels[neighbor_idx]
+    same_label_ratio = (neighbor_labels == labels[:, None]).mean(axis=1)
+    return float(np.mean(same_label_ratio))
+
+
+def compute_quality_metrics(features: np.ndarray, labels: np.ndarray, knn_k: int) -> Dict[str, float]:
+    unique_labels = np.unique(labels)
+    metrics = {
+        "silhouette_score": float("nan"),
+        "davies_bouldin_index": float("nan"),
+        "calinski_harabasz_index": float("nan"),
+        "knn_label_consistency": float("nan"),
+    }
+
+    # Silhouette/DBI/CH need at least 2 clusters and enough samples.
+    if features.shape[0] >= 3 and unique_labels.shape[0] >= 2:
+        try:
+            metrics["silhouette_score"] = float(silhouette_score(features, labels))
+        except Exception:
+            pass
+
+        try:
+            metrics["davies_bouldin_index"] = float(davies_bouldin_score(features, labels))
+        except Exception:
+            pass
+
+        try:
+            metrics["calinski_harabasz_index"] = float(calinski_harabasz_score(features, labels))
+        except Exception:
+            pass
+
+    metrics["knn_label_consistency"] = compute_knn_label_consistency(features, labels, k=knn_k)
+    return metrics
+
+
+def print_and_save_metrics(metrics_dict: Dict[str, Dict[str, float]], output_dir: str):
+    print("\n=== Quality Metrics ===")
+    for space_name, metric_values in metrics_dict.items():
+        print(f"[{space_name}]")
+        print(f"  Silhouette Score:         {metric_values['silhouette_score']:.6f}")
+        print(f"  Davies-Bouldin Index:     {metric_values['davies_bouldin_index']:.6f}")
+        print(f"  Calinski-Harabasz Index:  {metric_values['calinski_harabasz_index']:.6f}")
+        print(f"  kNN label consistency:    {metric_values['knn_label_consistency']:.6f}")
+
+    metrics_path = os.path.join(output_dir, "quality_metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics_dict, f, ensure_ascii=False, indent=2)
+    print(f"Metrics saved to: {metrics_path}")
 
 
 def _scatter_with_label_style(
@@ -365,6 +426,7 @@ def parse_args():
     )
     parser.add_argument("--umap_neighbors", type=int, default=30, help="UMAP n_neighbors.")
     parser.add_argument("--umap_min_dist", type=float, default=0.1, help="UMAP min_dist.")
+    parser.add_argument("--metric_knn_k", type=int, default=10, help="k for kNN label consistency metric.")
     parser.add_argument("--random_seed", type=int, default=42, help="Random seed.")
     return parser.parse_args()
 
@@ -436,6 +498,14 @@ def main():
         out_path=fig_path,
     )
     print(f"Visualization saved to: {fig_path}")
+
+    metrics = {
+        "diffusion_latent_l2": compute_quality_metrics(features_l2, labels, knn_k=args.metric_knn_k),
+        "spectral_embedding": compute_quality_metrics(spectral_embed, labels, knn_k=args.metric_knn_k),
+        "umap_diffusion_2d": compute_quality_metrics(diffusion_umap, labels, knn_k=args.metric_knn_k),
+        "umap_spectral_2d": compute_quality_metrics(spectral_umap, labels, knn_k=args.metric_knn_k),
+    }
+    print_and_save_metrics(metrics, args.output_dir)
 
     save_numeric_outputs(
         output_dir=args.output_dir,

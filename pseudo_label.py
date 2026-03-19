@@ -1,6 +1,7 @@
 import os
 import pickle
 import tarfile
+import json
 import numpy as np
 import torch
 import click
@@ -11,10 +12,13 @@ import training.networks as edm_networks
 from typing import Optional
 from sklearn.cluster import KMeans
 from sklearn.metrics import accuracy_score
+from sklearn.neighbors import NearestNeighbors
 import random
 import matplotlib.pyplot as plt
 import matplotlib
 from tqdm import tqdm
+from scipy import sparse
+from scipy.sparse.linalg import eigsh
 
 
 # ----------------------------------------------------------------------------
@@ -445,6 +449,103 @@ def save_features_for_tsne(features, labels, save_path):
         print(f"   特征维度: {features.shape}, 标签维度: {labels.shape}")
     except Exception as e:
         print(f"❌ 保存特征失败: {e}")
+
+
+def build_spectral_features_joint(
+        labeled_features,
+        unlabeled_features,
+        knn_k=15,
+        tau=0.0,
+        spectral_dim=16,
+        drop_first_eigvec=True
+):
+    """
+    基于合并后的 labeled+unlabeled 特征构造谱嵌入，再切分回两部分。
+    这样两部分共享同一特征空间，便于公平比较伪标签效果。
+    """
+    all_features = np.concatenate([labeled_features, unlabeled_features], axis=0).astype(np.float32)
+    n_samples = all_features.shape[0]
+    if n_samples < 3:
+        raise ValueError("谱嵌入至少需要 3 个样本。")
+
+    # L2 normalize
+    norms = np.linalg.norm(all_features, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-12)
+    z = all_features / norms
+
+    # kNN graph + RBF weights
+    k_eff = max(1, min(int(knn_k), n_samples - 1))
+    knn = NearestNeighbors(n_neighbors=k_eff + 1, metric='euclidean')
+    knn.fit(z)
+    distances, indices = knn.kneighbors(z, return_distance=True)
+    distances = distances[:, 1:]
+    indices = indices[:, 1:]
+    dist2 = distances ** 2
+
+    if tau > 0:
+        tau_used = float(tau)
+    else:
+        positive_dist2 = dist2[dist2 > 0]
+        tau_used = float(np.median(positive_dist2)) if positive_dist2.size > 0 else 1.0
+        tau_used = max(tau_used, 1e-12)
+
+    weights = np.exp(-dist2 / tau_used)
+    rows = np.repeat(np.arange(n_samples), k_eff)
+    cols = indices.reshape(-1)
+    vals = weights.reshape(-1)
+    w_directed = sparse.coo_matrix((vals, (rows, cols)), shape=(n_samples, n_samples)).tocsr()
+    w = w_directed.maximum(w_directed.T)
+    w.setdiag(0.0)
+    w.eliminate_zeros()
+
+    # S = D^{-1/2} W D^{-1/2}
+    degree = np.asarray(w.sum(axis=1)).reshape(-1)
+    degree_safe = np.maximum(degree, 1e-12)
+    d_inv_sqrt = 1.0 / np.sqrt(degree_safe)
+    d_inv_sqrt_mat = sparse.diags(d_inv_sqrt)
+    s = (d_inv_sqrt_mat @ w @ d_inv_sqrt_mat).tocsr()
+
+    # eigendecomposition
+    max_k = max(1, n_samples - 1)
+    extra = 1 if drop_first_eigvec else 0
+    k_total = min(int(spectral_dim) + extra, max_k)
+    eigvals, eigvecs = eigsh(s.asfptype(), k=k_total, which='LA', tol=1e-4)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+
+    start_idx = 1 if drop_first_eigvec and eigvecs.shape[1] > 1 else 0
+    end_idx = min(start_idx + int(spectral_dim), eigvecs.shape[1])
+    spectral = eigvecs[:, start_idx:end_idx].astype(np.float32)
+
+    n_labeled = labeled_features.shape[0]
+    labeled_spec = spectral[:n_labeled]
+    unlabeled_spec = spectral[n_labeled:]
+
+    print(f"谱嵌入完成: all={spectral.shape}, labeled={labeled_spec.shape}, unlabeled={unlabeled_spec.shape}")
+    print(f"谱图参数: k={k_eff}, tau={tau_used:.6e}, spectral_dim={spectral.shape[1]}")
+    return labeled_spec, unlabeled_spec, {'k': k_eff, 'tau': tau_used, 'top_eigenvalues': eigvals[:10].tolist()}
+
+
+def evaluate_pseudo_label_assignment(pseudo_labels, true_labels):
+    """评估伪标签分配效果，返回准确率、有效样本数与丢弃率。"""
+    pseudo_labels = np.asarray(pseudo_labels)
+    true_labels = np.asarray(true_labels)
+    valid_mask = pseudo_labels != -1
+    valid_count = int(np.sum(valid_mask))
+    total_count = int(len(pseudo_labels))
+    discard_rate = float(np.mean(pseudo_labels == -1))
+
+    if valid_count > 0:
+        acc = float(accuracy_score(true_labels[valid_mask], pseudo_labels[valid_mask]))
+    else:
+        acc = 0.0
+    return {
+        'accuracy': acc,
+        'valid_count': valid_count,
+        'total_count': total_count,
+        'discard_rate': discard_rate,
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -1594,11 +1695,18 @@ def generate_sigma_schedule(sigma_min, sigma_max, num_steps, rho):
 @click.option('--dp_epsilon', help='差分隐私预算 epsilon', type=float, default=1)
 @click.option('--dp_delta', help='差分隐私参数 delta', type=float, default=1e-5)
 @click.option('--dp_l2_clip', help='差分隐私 L2 范数截断阈值', type=float, default=100.0)
+@click.option('--compare_spectral_pseudo', help='比较 latent 与 spectral 的伪标签效果', is_flag=True, default=False)
+@click.option('--spectral_compare_k', help='谱嵌入构图 kNN 的 k 值', type=int, default=15)
+@click.option('--spectral_compare_tau', help='谱嵌入 RBF tau，<=0 自动估计', type=float, default=0.0)
+@click.option('--spectral_compare_dim', help='谱嵌入维度', type=int, default=16)
+@click.option('--spectral_compare_keep_first_eigvec', help='谱嵌入时保留第一特征向量', is_flag=True, default=False)
 def main(data, outdir, network_pkl, label_ratio, max_images, batch_size,
          test_sampling, visualize_clustering, similarity_method, cosine_threshold, distance_threshold,
          unlabeled_cluster_ratio, min_unlabeled_clusters, max_unlabeled_clusters, use_separate_clustering,
          num_sample, save_images, max_images_per_class, dataset_type, save_features, max_unlabeled_clusters_values,
          use_dp, dp_epsilon, dp_delta, dp_l2_clip,
+         compare_spectral_pseudo, spectral_compare_k, spectral_compare_tau, spectral_compare_dim,
+         spectral_compare_keep_first_eigvec,
          sigma_max=80.0, sigma_min=0.002, num_steps=100,
          rho=7.0):
     """基于UNet中间特征的数据集伪标签构建"""
@@ -1742,12 +1850,19 @@ def main(data, outdir, network_pkl, label_ratio, max_images, batch_size,
             os.path.join(outdir, 'all_features_metadata.npz'),
             is_labeled=is_labeled
         )
-        print("✅ 所有特征保存完成")
-        return
+        print("Features saved for t-SNE.")
+        if not compare_spectral_pseudo:
+            return
+        print("compare_spectral_pseudo=True, continue to pseudo-label comparison.")
 
     # 执行聚类和伪标签生成（包含可视化）
     print("执行聚类和伪标签生成...")
     visualization_path = os.path.join(outdir, 'clustering_quality_analysis.png') if visualize_clustering else None
+
+    
+    if compare_spectral_pseudo and max_unlabeled_clusters_values is not None:
+        print("Warning: compare_spectral_pseudo is skipped when max_unlabeled_clusters_values sweep is enabled.")
+        compare_spectral_pseudo = False
 
     if max_unlabeled_clusters_values is not None:
         s = max_unlabeled_clusters_values.strip()
@@ -1771,16 +1886,15 @@ def main(data, outdir, network_pkl, label_ratio, max_images, batch_size,
                 m_list = [int(x) for x in s.split(',') if x.strip()]
             except Exception:
                 m_list = []
-
         if len(m_list) == 0:
-            print("max上界列表解析失败，使用默认单次评估")
+            print("max list parse failed, use default single evaluation.")
         else:
-            print(f"max上界列表: {m_list}")
+            print(f"max list: {m_list}")
             results = []
             base_target = int(len(unlabeled_features) * unlabeled_cluster_ratio)
             for m in m_list:
                 k_candidate = max(min_unlabeled_clusters, min(m, base_target))
-                pseudo_labels, cluster_centers, cluster_to_label = perform_clustering_and_pseudo_labeling(
+                sweep_pseudo_labels, _, _ = perform_clustering_and_pseudo_labeling(
                     labeled_features, labeled_labels, unlabeled_features,
                     num_classes=num_classes,
                     save_visualization=None,
@@ -1791,80 +1905,135 @@ def main(data, outdir, network_pkl, label_ratio, max_images, batch_size,
                     use_separate_clustering=True,
                     unlabeled_n_clusters=k_candidate
                 )
-                valid_mask = pseudo_labels != -1
-                valid_pseudo_labels = pseudo_labels[valid_mask]
+                valid_mask = sweep_pseudo_labels != -1
+                valid_pseudo_labels = sweep_pseudo_labels[valid_mask]
                 valid_true_labels = unlabeled_labels[valid_mask]
-                if len(valid_pseudo_labels) > 0:
-                    acc = accuracy_score(valid_true_labels, valid_pseudo_labels)
-                else:
-                    acc = 0.0
-                discard_rate = float(np.mean(pseudo_labels == -1))
-                print(
-                    f"max={m} → K={k_candidate}: 准确率={acc:.4f}, 有效样本={np.sum(valid_mask)}/{len(pseudo_labels)}, 丢弃率={discard_rate:.4f}")
-                results.append((m, k_candidate, acc, int(np.sum(valid_mask)), int(len(pseudo_labels)), discard_rate))
-
+                acc = accuracy_score(valid_true_labels, valid_pseudo_labels) if len(valid_pseudo_labels) > 0 else 0.0
+                discard_rate = float(np.mean(sweep_pseudo_labels == -1))
+                print(f"max={m} -> K={k_candidate}: acc={acc:.4f}, valid={np.sum(valid_mask)}/{len(sweep_pseudo_labels)}, discard={discard_rate:.4f}")
+                results.append((m, k_candidate, acc, int(np.sum(valid_mask)), int(len(sweep_pseudo_labels)), discard_rate))
             if len(results) > 0:
                 best = max(results, key=lambda x: x[2])
-                print("\n=== max_unlabeled_clusters Sweep 结果 ===")
+                print("\n=== max_unlabeled_clusters sweep results ===")
                 for r in results:
-                    print(f"max={r[0]} → K={r[1]}, 准确率={r[2]:.4f}, 有效样本={r[3]}/{r[4]}, 丢弃率={r[5]:.4f}")
-                print(f"最佳max={best[0]} → K={best[1]}, 准确率={best[2]:.4f}")
+                    print(f"max={r[0]} -> K={r[1]}, acc={r[2]:.4f}, valid={r[3]}/{r[4]}, discard={r[5]:.4f}")
+                print(f"best max={best[0]} -> K={best[1]}, acc={best[2]:.4f}")
             return
-
-    # 计算无标签聚类数量
     if use_separate_clustering:
-        unlabeled_n_clusters = max(min_unlabeled_clusters,
-                                   min(max_unlabeled_clusters,
-                                       int(len(unlabeled_features) * unlabeled_cluster_ratio)))
-        print(f"使用独立无标签聚类策略，聚类数量: {unlabeled_n_clusters}")
+        unlabeled_n_clusters = max(
+            min_unlabeled_clusters,
+            min(max_unlabeled_clusters, int(len(unlabeled_features) * unlabeled_cluster_ratio))
+        )
+        print(f"use separate clustering for unlabeled data, n_clusters={unlabeled_n_clusters}")
     else:
         unlabeled_n_clusters = None
-        print("使用传统聚类策略")
-
-    pseudo_labels, cluster_centers, cluster_to_label = perform_clustering_and_pseudo_labeling(
-        labeled_features, labeled_labels, unlabeled_features,
-        num_classes=num_classes,
-        save_visualization=visualization_path,
-        similarity_method=similarity_method,
-        cosine_threshold=cosine_threshold,
-        distance_threshold=distance_threshold,
-        device=device,
-        use_separate_clustering=use_separate_clustering,
-        unlabeled_n_clusters=unlabeled_n_clusters
-    )
-    # 计算准确率（仅对有效的伪标签）
+        print("use traditional clustering strategy")
+    if compare_spectral_pseudo:
+        print("\n=== Start comparison: latent features vs spectral embedding ===")
+        latent_vis_path = visualization_path
+        spectral_vis_path = os.path.join(outdir, 'clustering_quality_analysis_spectral.png') if visualize_clustering else None
+        latent_pseudo_labels, latent_cluster_centers, latent_cluster_to_label = perform_clustering_and_pseudo_labeling(
+            labeled_features, labeled_labels, unlabeled_features,
+            num_classes=num_classes,
+            save_visualization=latent_vis_path,
+            similarity_method=similarity_method,
+            cosine_threshold=cosine_threshold,
+            distance_threshold=distance_threshold,
+            device=device,
+            use_separate_clustering=use_separate_clustering,
+            unlabeled_n_clusters=unlabeled_n_clusters
+        )
+        latent_eval = evaluate_pseudo_label_assignment(latent_pseudo_labels, unlabeled_labels)
+        labeled_spec, unlabeled_spec, spectral_meta = build_spectral_features_joint(
+            labeled_features=labeled_features,
+            unlabeled_features=unlabeled_features,
+            knn_k=spectral_compare_k,
+            tau=spectral_compare_tau,
+            spectral_dim=spectral_compare_dim,
+            drop_first_eigvec=(not spectral_compare_keep_first_eigvec),
+        )
+        spectral_pseudo_labels, spectral_cluster_centers, spectral_cluster_to_label = perform_clustering_and_pseudo_labeling(
+            labeled_spec, labeled_labels, unlabeled_spec,
+            num_classes=num_classes,
+            save_visualization=spectral_vis_path,
+            similarity_method=similarity_method,
+            cosine_threshold=cosine_threshold,
+            distance_threshold=distance_threshold,
+            device=device,
+            use_separate_clustering=use_separate_clustering,
+            unlabeled_n_clusters=unlabeled_n_clusters
+        )
+        spectral_eval = evaluate_pseudo_label_assignment(spectral_pseudo_labels, unlabeled_labels)
+        print("\n=== Latent vs Spectral pseudo-label comparison ===")
+        print(f"[latent ] acc={latent_eval['accuracy']:.4f}, valid={latent_eval['valid_count']}/{latent_eval['total_count']}, discard={latent_eval['discard_rate']:.4f}")
+        print(f"[spectral] acc={spectral_eval['accuracy']:.4f}, valid={spectral_eval['valid_count']}/{spectral_eval['total_count']}, discard={spectral_eval['discard_rate']:.4f}")
+        if spectral_eval['accuracy'] > latent_eval['accuracy']:
+            selected_space = 'spectral'
+        elif spectral_eval['accuracy'] < latent_eval['accuracy']:
+            selected_space = 'latent'
+        else:
+            selected_space = 'spectral' if spectral_eval['discard_rate'] < latent_eval['discard_rate'] else 'latent'
+        if selected_space == 'spectral':
+            pseudo_labels = spectral_pseudo_labels
+            cluster_centers = spectral_cluster_centers
+            cluster_to_label = spectral_cluster_to_label
+        else:
+            pseudo_labels = latent_pseudo_labels
+            cluster_centers = latent_cluster_centers
+            cluster_to_label = latent_cluster_to_label
+        comparison = {
+            'selected_space': selected_space,
+            'latent': latent_eval,
+            'spectral': spectral_eval,
+            'spectral_graph': spectral_meta,
+            'settings': {
+                'similarity_method': similarity_method,
+                'cosine_threshold': cosine_threshold,
+                'distance_threshold': distance_threshold,
+                'use_separate_clustering': bool(use_separate_clustering),
+                'unlabeled_n_clusters': int(unlabeled_n_clusters) if unlabeled_n_clusters is not None else None,
+            }
+        }
+        comparison_path = os.path.join(outdir, 'latent_vs_spectral_pseudo_comparison.json')
+        with open(comparison_path, 'w', encoding='utf-8') as f:
+            json.dump(comparison, f, ensure_ascii=False, indent=2)
+        print(f"comparison saved: {comparison_path}")
+        print(f"selected space for downstream outputs: {selected_space}")
+    else:
+        pseudo_labels, cluster_centers, cluster_to_label = perform_clustering_and_pseudo_labeling(
+            labeled_features, labeled_labels, unlabeled_features,
+            num_classes=num_classes,
+            save_visualization=visualization_path,
+            similarity_method=similarity_method,
+            cosine_threshold=cosine_threshold,
+            distance_threshold=distance_threshold,
+            device=device,
+            use_separate_clustering=use_separate_clustering,
+            unlabeled_n_clusters=unlabeled_n_clusters
+        )
     valid_mask = pseudo_labels != -1
     valid_pseudo_labels = pseudo_labels[valid_mask]
     valid_true_labels = unlabeled_labels[valid_mask]
-
     if len(valid_pseudo_labels) > 0:
         accuracy = accuracy_score(valid_true_labels, valid_pseudo_labels)
-        print(f"\n=== 伪标签准确率评估 ===")
-        print(f"有效样本准确率: {accuracy:.4f} ({accuracy * 100:.2f}%)")
-        print(f"评估样本数: {len(valid_pseudo_labels)} / {len(pseudo_labels)}")
-
-        # 按类别统计准确率
-        print("\n按类别统计:")
+        print("\n=== Pseudo-label accuracy (final selected space) ===")
+        print(f"Valid-sample accuracy: {accuracy:.4f} ({accuracy * 100:.2f}%)")
+        print(f"Evaluated samples: {len(valid_pseudo_labels)} / {len(pseudo_labels)}")
+        print("\nPer-class accuracy:")
         for class_id in range(num_classes):
             class_mask = valid_true_labels == class_id
             if np.sum(class_mask) > 0:
                 class_accuracy = accuracy_score(valid_true_labels[class_mask], valid_pseudo_labels[class_mask])
-                print(f"  类别 {class_id}: {class_accuracy:.4f} ({np.sum(class_mask)} 个有效样本)")
+                print(f"  class {class_id}: {class_accuracy:.4f} ({np.sum(class_mask)} valid samples)")
     else:
-        print(f"\n=== 伪标签准确率评估 ===")
-        print("❌ 没有有效的伪标签，无法计算准确率！")
-
+        print("\n=== Pseudo-label accuracy (final selected space) ===")
+        print("No valid pseudo labels, cannot compute accuracy.")
     if visualize_clustering:
-        print(f"\n📊 聚类质量可视化已保存到: {visualization_path}")
-        print("可视化包含:")
-        print("  1. 聚类-标签混淆矩阵: 显示每个聚类中各标签的分布")
-        print("  2. 聚类纯度分析: 每个聚类中主要标签的占比")
-        print("  3. PCA降维可视化: 按真实标签着色的特征分布")
-        print("  4. PCA降维可视化: 按聚类结果着色的特征分布")
-
-    # 保存伪标签分配的图像（如果启用）
+        print(f"\nclustering visualization saved to: {visualization_path}")
+        if compare_spectral_pseudo:
+            print(f"spectral-space clustering visualization saved to: {os.path.join(outdir, 'clustering_quality_analysis_spectral.png')}")
     if save_images:
-        print(f"\n💾 开始保存伪标签分配的图像...")
+        print("\nstart saving pseudo-label grouped images...")
         save_images_by_pseudo_labels(
             images=unlabeled_images,
             pseudo_labels=pseudo_labels,
@@ -1873,10 +2042,8 @@ def main(data, outdir, network_pkl, label_ratio, max_images, batch_size,
             max_images_per_class=max_images_per_class,
             dataset_type=dataset_type
         )
-        print(f"✅ 图像保存完成！")
+        print("image saving finished.")
     else:
-        print(f"\n💾 跳过图像保存（使用 --save_images 启用）")
-
-
+        print("\nskip image saving (enable with --save_images).")
 if __name__ == "__main__":
     main()
