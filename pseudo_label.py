@@ -560,9 +560,24 @@ def extract_features_with_acgan(acgan_model, images, layer='flatten', device='cu
     if images_tensor.shape[1] not in [1, 3] and images_tensor.shape[-1] in [1, 3]:
         images_tensor = images_tensor.permute(0, 3, 1, 2).contiguous()
 
-    # ACGAN here is RGB; repeat grayscale channels if needed.
-    if images_tensor.shape[1] == 1:
-        images_tensor = images_tensor.repeat(1, 3, 1, 1)
+    # Adapt input channels to what the discriminator actually expects.
+    expected_c = None
+    try:
+        first_conv = acgan_model.discriminator.blocks[0][0]
+        if hasattr(first_conv, 'in_channels'):
+            expected_c = int(first_conv.in_channels)
+    except Exception:
+        expected_c = None
+
+    if expected_c is not None and images_tensor.shape[1] != expected_c:
+        if expected_c == 1 and images_tensor.shape[1] == 3:
+            images_tensor = images_tensor.mean(dim=1, keepdim=True)
+        elif expected_c == 3 and images_tensor.shape[1] == 1:
+            images_tensor = images_tensor.repeat(1, 3, 1, 1)
+        else:
+            raise ValueError(
+                f"ACGAN discriminator expects {expected_c} channels, but input has {images_tensor.shape[1]} channels."
+            )
 
     with torch.no_grad():
         feat = acgan_model.extract_features(
