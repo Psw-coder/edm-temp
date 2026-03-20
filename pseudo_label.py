@@ -42,6 +42,134 @@ def load_network(network_pkl_path, device='cuda'):
     return net
 
 
+def _strip_module_prefix(state_dict):
+    if not isinstance(state_dict, dict):
+        return state_dict
+    if not any(k.startswith('module.') for k in state_dict.keys()):
+        return state_dict
+    return {k[len('module.'):]: v for k, v in state_dict.items()}
+
+
+def _extract_candidate_state_dict(obj):
+    if isinstance(obj, dict):
+        for key in ['state_dict', 'model_state_dict', 'acgan_state_dict', 'model', 'net']:
+            if key in obj and isinstance(obj[key], dict):
+                return _strip_module_prefix(obj[key])
+        return _strip_module_prefix(obj)
+    return None
+
+
+def _infer_acgan_arch(candidate_state_dict, fallback_img_channels=3, fallback_num_classes=10, fallback_img_size=32,
+                      fallback_latent_dim=100):
+    img_channels = int(fallback_img_channels)
+    num_classes = int(fallback_num_classes)
+    img_size = int(fallback_img_size)
+    latent_dim = int(fallback_latent_dim)
+
+    if not isinstance(candidate_state_dict, dict):
+        return img_channels, num_classes, img_size, latent_dim
+
+    # Infer label_dim and latent_dim from embedding.
+    w = candidate_state_dict.get('generator.label_emb.weight', None)
+    if isinstance(w, torch.Tensor) and w.ndim == 2:
+        num_classes = int(w.shape[0])
+        latent_dim = int(w.shape[1])
+
+    # Infer latent_dim and img_size from the first FC of generator.
+    w = candidate_state_dict.get('generator.l1.0.weight', None)
+    if isinstance(w, torch.Tensor) and w.ndim == 2:
+        latent_dim = int(w.shape[1])
+        out_features = int(w.shape[0])
+        # out_features = 128 * (img_size//4)^2
+        if out_features % 128 == 0:
+            init_sq = out_features // 128
+            init_size = int(round(np.sqrt(init_sq)))
+            if init_size * init_size == init_sq:
+                img_size = int(init_size * 4)
+
+    # Infer img_channels from generator final conv first, then discriminator first conv.
+    w = candidate_state_dict.get('generator.conv_blocks.9.weight', None)
+    if isinstance(w, torch.Tensor) and w.ndim == 4:
+        img_channels = int(w.shape[0])
+    else:
+        w = candidate_state_dict.get('discriminator.blocks.0.0.weight', None)
+        if isinstance(w, torch.Tensor) and w.ndim == 4:
+            img_channels = int(w.shape[1])
+
+    return img_channels, num_classes, img_size, latent_dim
+
+
+def load_acgan_model(
+        acgan_ckpt_path,
+        device='cuda',
+        img_channels=3,
+        num_classes=10,
+        img_size=32,
+        latent_dim=None,
+):
+    """Load ACGAN model and restore generator/discriminator weights."""
+    from ACGAN_training.ACGAN import ACGAN
+
+    print(f'Loading ACGAN from "{acgan_ckpt_path}"...')
+
+    obj = torch.load(acgan_ckpt_path, map_location=device)
+
+    if isinstance(obj, torch.nn.Module):
+        model = obj.to(device).eval()
+        return model
+
+    if not isinstance(obj, dict):
+        raise ValueError(f"Unsupported ACGAN checkpoint type: {type(obj)}")
+
+    candidate = _extract_candidate_state_dict(obj)
+    fallback_latent_dim = int(latent_dim) if latent_dim is not None else 100
+    inferred_img_channels, inferred_num_classes, inferred_img_size, inferred_latent_dim = _infer_acgan_arch(
+        candidate_state_dict=candidate,
+        fallback_img_channels=img_channels,
+        fallback_num_classes=num_classes,
+        fallback_img_size=img_size,
+        fallback_latent_dim=fallback_latent_dim,
+    )
+    if latent_dim is not None:
+        inferred_latent_dim = int(latent_dim)
+    print(f"Inferred/used ACGAN config: img_channels={inferred_img_channels}, "
+          f"num_classes={inferred_num_classes}, img_size={inferred_img_size}, latent_dim={inferred_latent_dim}")
+
+    model = ACGAN(
+        img_dim=inferred_img_channels,
+        label_dim=inferred_num_classes,
+        img_size=inferred_img_size,
+        latent_dim=inferred_latent_dim,
+        device=device,
+    ).to(device)
+    model.eval()
+
+    loaded_any = False
+
+    if any(k.startswith('generator.') or k.startswith('discriminator.') for k in candidate.keys()):
+        missing, unexpected = model.load_state_dict(candidate, strict=False)
+        loaded_any = True
+        print(f"ACGAN(full) loaded: missing={len(missing)}, unexpected={len(unexpected)}")
+
+    if not loaded_any and 'generator' in obj and isinstance(obj['generator'], dict):
+        g_sd = _strip_module_prefix(obj['generator'])
+        missing, unexpected = model.generator.load_state_dict(g_sd, strict=False)
+        loaded_any = True
+        print(f"ACGAN(generator) loaded: missing={len(missing)}, unexpected={len(unexpected)}")
+
+    if not loaded_any and 'discriminator' in obj and isinstance(obj['discriminator'], dict):
+        d_sd = _strip_module_prefix(obj['discriminator'])
+        missing, unexpected = model.discriminator.load_state_dict(d_sd, strict=False)
+        loaded_any = True
+        print(f"ACGAN(discriminator) loaded: missing={len(missing)}, unexpected={len(unexpected)}")
+
+    if not loaded_any:
+        missing, unexpected = model.load_state_dict(candidate, strict=False)
+        print(f"ACGAN(fallback) loaded: missing={len(missing)}, unexpected={len(unexpected)}")
+
+    return model
+
+
 # ----------------------------------------------------------------------------
 # EDM 采样器 (用于验证模型)
 
@@ -370,6 +498,34 @@ def extract_features_with_noise(net, images, sigma, step_idx, device='cuda'):
         return averaged_features.cpu().numpy()
     else:
         raise ValueError("没有提取到有效的特征")
+
+
+def extract_features_with_acgan(acgan_model, images, layer='flatten', device='cuda'):
+    """Extract ACGAN discriminator intermediate features for real images."""
+    images_tensor = preprocess_image(images).to(device)
+
+    if images_tensor.ndim != 4:
+        raise ValueError(f"Expected 4D input for ACGAN features, got {images_tensor.shape}")
+
+    # Convert HWC -> CHW when needed.
+    if images_tensor.shape[1] not in [1, 3] and images_tensor.shape[-1] in [1, 3]:
+        images_tensor = images_tensor.permute(0, 3, 1, 2).contiguous()
+
+    # ACGAN here is RGB; repeat grayscale channels if needed.
+    if images_tensor.shape[1] == 1:
+        images_tensor = images_tensor.repeat(1, 3, 1, 1)
+
+    with torch.no_grad():
+        feat = acgan_model.extract_features(
+            network='discriminator',
+            x=images_tensor,
+            layer=layer,
+            detach=True,
+        )
+
+    if feat.ndim > 2:
+        feat = feat.view(feat.shape[0], -1)
+    return feat.cpu().numpy()
 
 
 def apply_local_dp_to_features(features, epsilon, delta, l2_clip=1.0, rng=None):
@@ -1668,6 +1824,13 @@ def generate_sigma_schedule(sigma_min, sigma_max, num_steps, rho):
 @click.option('--network_pkl', help='预训练网络的pickle文件路径', metavar='PATH', type=str,
               # default='/data/psw/edm/checkpoint/edm-cifar10-32x32-uncond-vp.pkl')
               default='/data/psw/edm/run/00013-stl10-uncond-ddpmpp-edm-gpus4-batch64-fp32/network-snapshot-042540.pkl')
+@click.option('--feature_backbone', help='Feature extractor backbone', type=click.Choice(['diffusion', 'acgan']),
+              default='diffusion')
+@click.option('--compare_diffusion_gan_pseudo', help='Compare pseudo-label performance of diffusion and ACGAN features',
+              is_flag=True, default=False)
+@click.option('--acgan_ckpt', help='ACGAN checkpoint path', metavar='PATH', type=str, default=None)
+@click.option('--acgan_layer', help='ACGAN discriminator feature layer', type=str, default='flatten')
+@click.option('--acgan_latent_dim', help='ACGAN latent dim (default: auto infer from checkpoint)', type=int, default=None)
 # default='/data/psw/edm/ckpt_mnist/network-snapshot-019344.pkl')
 @click.option('--label_ratio', help='有标签数据的比例', metavar='FLOAT', type=float, default=0.05)
 @click.option('--max_images', help='使用的最大图像数量', metavar='INT', type=int, default=10000)
@@ -1700,7 +1863,8 @@ def generate_sigma_schedule(sigma_min, sigma_max, num_steps, rho):
 @click.option('--spectral_compare_tau', help='谱嵌入 RBF tau，<=0 自动估计', type=float, default=0.0)
 @click.option('--spectral_compare_dim', help='谱嵌入维度', type=int, default=16)
 @click.option('--spectral_compare_keep_first_eigvec', help='谱嵌入时保留第一特征向量', is_flag=True, default=False)
-def main(data, outdir, network_pkl, label_ratio, max_images, batch_size,
+def main(data, outdir, network_pkl, feature_backbone, compare_diffusion_gan_pseudo, acgan_ckpt, acgan_layer,
+         acgan_latent_dim, label_ratio, max_images, batch_size,
          test_sampling, visualize_clustering, similarity_method, cosine_threshold, distance_threshold,
          unlabeled_cluster_ratio, min_unlabeled_clusters, max_unlabeled_clusters, use_separate_clustering,
          num_sample, save_images, max_images_per_class, dataset_type, save_features, max_unlabeled_clusters_values,
@@ -1757,6 +1921,22 @@ def main(data, outdir, network_pkl, label_ratio, max_images, batch_size,
     # 根据数据集类型确定类别数量
     num_classes = 10 if dataset_type in ['cifar10', 'fashion-mnist', 'mnist', 'svhn', 'stl10'] else 100
 
+    acgan_model = None
+    need_acgan_features = (feature_backbone == 'acgan') or compare_diffusion_gan_pseudo
+    if need_acgan_features:
+        if acgan_ckpt is None:
+            raise click.ClickException("Please provide --acgan_ckpt when using ACGAN features.")
+        img_size = int(images.shape[2]) if images.ndim == 4 else 32
+        acgan_model = load_acgan_model(
+            acgan_ckpt_path=acgan_ckpt,
+            device=device,
+            img_channels=3,
+            num_classes=num_classes,
+            img_size=img_size,
+            latent_dim=acgan_latent_dim,
+        )
+        print(f"ACGAN params:{sum([p.numel() for p in acgan_model.parameters()])}")
+
     # 分割有标签和无标签数据
     labeled_images, labeled_labels, unlabeled_images, unlabeled_labels = split_labeled_unlabeled(
         images, labels, label_ratio
@@ -1800,6 +1980,38 @@ def main(data, outdir, network_pkl, label_ratio, max_images, batch_size,
     print(f"聚类特征维度：{unlabeled_features.shape}")
     print(f"特征提取完成: 有标签特征 {labeled_features.shape}, 无标签特征 {unlabeled_features.shape}")
 
+    diffusion_labeled_features = labeled_features
+    diffusion_unlabeled_features = unlabeled_features
+    acgan_labeled_features = None
+    acgan_unlabeled_features = None
+
+    if need_acgan_features:
+        print(f"Extracting ACGAN features from discriminator layer: {acgan_layer}")
+        acgan_labeled_features_list = []
+        num_labeled_batches = (len(labeled_images) + batch_size - 1) // batch_size
+        for i in tqdm(range(0, len(labeled_images), batch_size), desc="Extract ACGAN labeled", total=num_labeled_batches,
+                      unit="batch"):
+            batch_images = labeled_images[i:i + batch_size]
+            acgan_labeled_features_list.append(
+                extract_features_with_acgan(acgan_model, batch_images, layer=acgan_layer, device=device)
+            )
+        acgan_labeled_features = np.concatenate(acgan_labeled_features_list, axis=0)
+
+        acgan_unlabeled_features_list = []
+        num_unlabeled_batches = (len(unlabeled_images) + batch_size - 1) // batch_size
+        for i in tqdm(range(0, len(unlabeled_images), batch_size), desc="Extract ACGAN unlabeled",
+                      total=num_unlabeled_batches, unit="batch"):
+            batch_images = unlabeled_images[i:i + batch_size]
+            acgan_unlabeled_features_list.append(
+                extract_features_with_acgan(acgan_model, batch_images, layer=acgan_layer, device=device)
+            )
+        acgan_unlabeled_features = np.concatenate(acgan_unlabeled_features_list, axis=0)
+        print(f"ACGAN feature shapes: labeled={acgan_labeled_features.shape}, unlabeled={acgan_unlabeled_features.shape}")
+
+        if feature_backbone == 'acgan':
+            labeled_features = acgan_labeled_features
+            unlabeled_features = acgan_unlabeled_features
+
     if use_dp:
         print("\n=== 对特征应用本地差分隐私 ===")
         labeled_features = apply_local_dp_to_features(
@@ -1817,6 +2029,27 @@ def main(data, outdir, network_pkl, label_ratio, max_images, batch_size,
         print("差分隐私处理完成")
 
     # 保存特征用于t-SNE (如果启用)
+    if compare_diffusion_gan_pseudo and use_dp:
+        diffusion_labeled_features = apply_local_dp_to_features(
+            diffusion_labeled_features, epsilon=dp_epsilon, delta=dp_delta, l2_clip=dp_l2_clip
+        )
+        diffusion_unlabeled_features = apply_local_dp_to_features(
+            diffusion_unlabeled_features, epsilon=dp_epsilon, delta=dp_delta, l2_clip=dp_l2_clip
+        )
+        if acgan_labeled_features is not None and acgan_unlabeled_features is not None:
+            acgan_labeled_features = apply_local_dp_to_features(
+                acgan_labeled_features, epsilon=dp_epsilon, delta=dp_delta, l2_clip=dp_l2_clip
+            )
+            acgan_unlabeled_features = apply_local_dp_to_features(
+                acgan_unlabeled_features, epsilon=dp_epsilon, delta=dp_delta, l2_clip=dp_l2_clip
+            )
+        if feature_backbone == 'acgan' and acgan_labeled_features is not None:
+            labeled_features = acgan_labeled_features
+            unlabeled_features = acgan_unlabeled_features
+        else:
+            labeled_features = diffusion_labeled_features
+            unlabeled_features = diffusion_unlabeled_features
+
     if save_features:
         print("\n=== 保存特征用于t-SNE ===")
         # 保存有标签特征
@@ -1851,7 +2084,7 @@ def main(data, outdir, network_pkl, label_ratio, max_images, batch_size,
             is_labeled=is_labeled
         )
         print("Features saved for t-SNE.")
-        if not compare_spectral_pseudo:
+        if (not compare_spectral_pseudo) and (not compare_diffusion_gan_pseudo):
             return
         print("compare_spectral_pseudo=True, continue to pseudo-label comparison.")
 
@@ -1863,6 +2096,9 @@ def main(data, outdir, network_pkl, label_ratio, max_images, batch_size,
     if compare_spectral_pseudo and max_unlabeled_clusters_values is not None:
         print("Warning: compare_spectral_pseudo is skipped when max_unlabeled_clusters_values sweep is enabled.")
         compare_spectral_pseudo = False
+    if compare_diffusion_gan_pseudo and max_unlabeled_clusters_values is not None:
+        print("Warning: compare_diffusion_gan_pseudo is skipped when max_unlabeled_clusters_values sweep is enabled.")
+        compare_diffusion_gan_pseudo = False
 
     if max_unlabeled_clusters_values is not None:
         s = max_unlabeled_clusters_values.strip()
@@ -1928,7 +2164,60 @@ def main(data, outdir, network_pkl, label_ratio, max_images, batch_size,
     else:
         unlabeled_n_clusters = None
         print("use traditional clustering strategy")
-    if compare_spectral_pseudo:
+    if compare_diffusion_gan_pseudo:
+        if (acgan_labeled_features is None) or (acgan_unlabeled_features is None):
+            raise click.ClickException("ACGAN features are required for --compare_diffusion_gan_pseudo")
+
+        print("\n=== Start comparison: diffusion features vs ACGAN features ===")
+        comparison_results = {}
+        cache = {}
+        for space_name, lf, uf in [
+            ('diffusion', diffusion_labeled_features, diffusion_unlabeled_features),
+            ('acgan', acgan_labeled_features, acgan_unlabeled_features),
+        ]:
+            space_vis = os.path.join(outdir, f'clustering_quality_analysis_{space_name}.png') if visualize_clustering else None
+            pl, centers, c2l = perform_clustering_and_pseudo_labeling(
+                lf, labeled_labels, uf,
+                num_classes=num_classes,
+                save_visualization=space_vis,
+                similarity_method=similarity_method,
+                cosine_threshold=cosine_threshold,
+                distance_threshold=distance_threshold,
+                device=device,
+                use_separate_clustering=use_separate_clustering,
+                unlabeled_n_clusters=unlabeled_n_clusters
+            )
+            ev = evaluate_pseudo_label_assignment(pl, unlabeled_labels)
+            comparison_results[space_name] = ev
+            cache[space_name] = (pl, centers, c2l)
+            print(f"[{space_name}] acc={ev['accuracy']:.4f}, valid={ev['valid_count']}/{ev['total_count']}, discard={ev['discard_rate']:.4f}")
+
+        if comparison_results['acgan']['accuracy'] > comparison_results['diffusion']['accuracy']:
+            selected_space = 'acgan'
+        elif comparison_results['acgan']['accuracy'] < comparison_results['diffusion']['accuracy']:
+            selected_space = 'diffusion'
+        else:
+            selected_space = 'acgan' if comparison_results['acgan']['discard_rate'] < comparison_results['diffusion']['discard_rate'] else 'diffusion'
+
+        pseudo_labels, cluster_centers, cluster_to_label = cache[selected_space]
+        comparison_path = os.path.join(outdir, 'diffusion_vs_acgan_pseudo_comparison.json')
+        with open(comparison_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'selected_space': selected_space,
+                'diffusion': comparison_results['diffusion'],
+                'acgan': comparison_results['acgan'],
+                'settings': {
+                    'acgan_layer': acgan_layer,
+                    'similarity_method': similarity_method,
+                    'cosine_threshold': cosine_threshold,
+                    'distance_threshold': distance_threshold,
+                    'use_separate_clustering': bool(use_separate_clustering),
+                    'unlabeled_n_clusters': int(unlabeled_n_clusters) if unlabeled_n_clusters is not None else None,
+                }
+            }, f, ensure_ascii=False, indent=2)
+        print(f"comparison saved: {comparison_path}")
+        print(f"selected space for downstream outputs: {selected_space}")
+    elif compare_spectral_pseudo:
         print("\n=== Start comparison: latent features vs spectral embedding ===")
         latent_vis_path = visualization_path
         spectral_vis_path = os.path.join(outdir, 'clustering_quality_analysis_spectral.png') if visualize_clustering else None
@@ -2032,6 +2321,9 @@ def main(data, outdir, network_pkl, label_ratio, max_images, batch_size,
         print(f"\nclustering visualization saved to: {visualization_path}")
         if compare_spectral_pseudo:
             print(f"spectral-space clustering visualization saved to: {os.path.join(outdir, 'clustering_quality_analysis_spectral.png')}")
+        if compare_diffusion_gan_pseudo:
+            print(f"diffusion-space clustering visualization saved to: {os.path.join(outdir, 'clustering_quality_analysis_diffusion.png')}")
+            print(f"acgan-space clustering visualization saved to: {os.path.join(outdir, 'clustering_quality_analysis_acgan.png')}")
     if save_images:
         print("\nstart saving pseudo-label grouped images...")
         save_images_by_pseudo_labels(

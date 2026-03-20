@@ -1,0 +1,25 @@
+# Normalize text files in repository and keep binary files untouched.
+* text=auto
+
+# Source/docs/config should be UTF-8 in working tree.
+*.py text working-tree-encoding=UTF-8
+*.md text working-tree-encoding=UTF-8
+*.txt text working-tree-encoding=UTF-8
+*.yml text working-tree-encoding=UTF-8
+*.yaml text working-tree-encoding=UTF-8
+*.json text working-tree-encoding=UTF-8
+*.sh text working-tree-encoding=UTF-8
+
+# Windows scripts keep CRLF ergonomics.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf working-tree-encoding=UTF-8
+
+# Common binary assets.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.pt binary
+*.pth binary
