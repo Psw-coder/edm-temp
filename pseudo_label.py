@@ -1813,6 +1813,15 @@ def generate_sigma_schedule(sigma_min, sigma_max, num_steps, rho):
 
 # ----------------------------------------------------------------------------
 # 主函数
+'''python pseudo_label.py \
+  --data /data/psw/DFLSemi_diffusion/samples/mnist/MNIST/raw \
+  --network_pkl ckpt_mnist/network-snapshot-019344.pkl \
+  --acgan_ckpt /data/psw/edm/gan-ckpt/mnist/acgan_epoch_0100.pt \
+  --compare_diffusion_gan_pseudo \
+  --dataset_type mnist \
+  --acgan_layer flatten \
+  --acgan_latent_dim 1280
+'''
 @click.command()
 @click.option('--data', help='数据集tar.gz文件路径', metavar='PATH', type=str,
               # default='/data/psw/edm/data')
@@ -1927,10 +1936,12 @@ def main(data, outdir, network_pkl, feature_backbone, compare_diffusion_gan_pseu
         if acgan_ckpt is None:
             raise click.ClickException("Please provide --acgan_ckpt when using ACGAN features.")
         img_size = int(images.shape[2]) if images.ndim == 4 else 32
+        gan_channel = 1 if dataset_type in ["mnist",'fashion-mnist'] else 3
+   
         acgan_model = load_acgan_model(
             acgan_ckpt_path=acgan_ckpt,
             device=device,
-            img_channels=3,
+            img_channels=gan_channel,
             num_classes=num_classes,
             img_size=img_size,
             latent_dim=acgan_latent_dim,

@@ -17,3 +17,6 @@ run
 output
 out
 tmp
+gan-ckpt
+spectral_analysis_output
+feature_metrics.json
