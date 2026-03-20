@@ -59,6 +59,29 @@ def _extract_candidate_state_dict(obj):
     return None
 
 
+def _safe_partial_load(module, state_dict, module_name='module'):
+    """Load compatible keys only, and skip mismatched tensor shapes."""
+    if not isinstance(state_dict, dict):
+        return [], [], []
+
+    target_sd = module.state_dict()
+    filtered_sd = {}
+    skipped_shape = []
+    for key, value in state_dict.items():
+        if key in target_sd and isinstance(value, torch.Tensor) and isinstance(target_sd[key], torch.Tensor):
+            if tuple(value.shape) != tuple(target_sd[key].shape):
+                skipped_shape.append((key, tuple(value.shape), tuple(target_sd[key].shape)))
+                continue
+        filtered_sd[key] = value
+
+    missing, unexpected = module.load_state_dict(filtered_sd, strict=False)
+    if skipped_shape:
+        preview = ', '.join([f"{k}: ckpt{src}->model{dst}" for k, src, dst in skipped_shape[:4]])
+        suffix = ' ...' if len(skipped_shape) > 4 else ''
+        print(f"{module_name}: skipped {len(skipped_shape)} mismatched keys ({preview}{suffix})")
+    return missing, unexpected, skipped_shape
+
+
 def _infer_acgan_arch(candidate_state_dict, fallback_img_channels=3, fallback_num_classes=10, fallback_img_size=32,
                       fallback_latent_dim=100):
     img_channels = int(fallback_img_channels)
@@ -69,14 +92,40 @@ def _infer_acgan_arch(candidate_state_dict, fallback_img_channels=3, fallback_nu
     if not isinstance(candidate_state_dict, dict):
         return img_channels, num_classes, img_size, latent_dim
 
+    generator_sd = None
+    discriminator_sd = None
+    if isinstance(candidate_state_dict.get('generator', None), dict):
+        generator_sd = _strip_module_prefix(candidate_state_dict['generator'])
+    if isinstance(candidate_state_dict.get('discriminator', None), dict):
+        discriminator_sd = _strip_module_prefix(candidate_state_dict['discriminator'])
+
+    def _lookup_tensor(keys):
+        for key in keys:
+            w_local = candidate_state_dict.get(key, None)
+            if isinstance(w_local, torch.Tensor):
+                return w_local
+        if isinstance(generator_sd, dict):
+            for key in keys:
+                plain_key = key.replace('generator.', '')
+                w_local = generator_sd.get(plain_key, None)
+                if isinstance(w_local, torch.Tensor):
+                    return w_local
+        if isinstance(discriminator_sd, dict):
+            for key in keys:
+                plain_key = key.replace('discriminator.', '')
+                w_local = discriminator_sd.get(plain_key, None)
+                if isinstance(w_local, torch.Tensor):
+                    return w_local
+        return None
+
     # Infer label_dim and latent_dim from embedding.
-    w = candidate_state_dict.get('generator.label_emb.weight', None)
+    w = _lookup_tensor(['generator.label_emb.weight', 'label_emb.weight'])
     if isinstance(w, torch.Tensor) and w.ndim == 2:
         num_classes = int(w.shape[0])
         latent_dim = int(w.shape[1])
 
     # Infer latent_dim and img_size from the first FC of generator.
-    w = candidate_state_dict.get('generator.l1.0.weight', None)
+    w = _lookup_tensor(['generator.l1.0.weight', 'l1.0.weight'])
     if isinstance(w, torch.Tensor) and w.ndim == 2:
         latent_dim = int(w.shape[1])
         out_features = int(w.shape[0])
@@ -88,11 +137,11 @@ def _infer_acgan_arch(candidate_state_dict, fallback_img_channels=3, fallback_nu
                 img_size = int(init_size * 4)
 
     # Infer img_channels from generator final conv first, then discriminator first conv.
-    w = candidate_state_dict.get('generator.conv_blocks.9.weight', None)
+    w = _lookup_tensor(['generator.conv_blocks.9.weight', 'conv_blocks.9.weight'])
     if isinstance(w, torch.Tensor) and w.ndim == 4:
         img_channels = int(w.shape[0])
     else:
-        w = candidate_state_dict.get('discriminator.blocks.0.0.weight', None)
+        w = _lookup_tensor(['discriminator.blocks.0.0.weight', 'blocks.0.0.weight'])
         if isinstance(w, torch.Tensor) and w.ndim == 4:
             img_channels = int(w.shape[1])
 
@@ -146,25 +195,25 @@ def load_acgan_model(
 
     loaded_any = False
 
-    if any(k.startswith('generator.') or k.startswith('discriminator.') for k in candidate.keys()):
-        missing, unexpected = model.load_state_dict(candidate, strict=False)
+    if isinstance(candidate, dict) and any(k.startswith('generator.') or k.startswith('discriminator.') for k in candidate.keys()):
+        missing, unexpected, _ = _safe_partial_load(model, candidate, module_name='ACGAN(full)')
         loaded_any = True
         print(f"ACGAN(full) loaded: missing={len(missing)}, unexpected={len(unexpected)}")
 
     if not loaded_any and 'generator' in obj and isinstance(obj['generator'], dict):
         g_sd = _strip_module_prefix(obj['generator'])
-        missing, unexpected = model.generator.load_state_dict(g_sd, strict=False)
+        missing, unexpected, _ = _safe_partial_load(model.generator, g_sd, module_name='ACGAN(generator)')
         loaded_any = True
         print(f"ACGAN(generator) loaded: missing={len(missing)}, unexpected={len(unexpected)}")
 
     if not loaded_any and 'discriminator' in obj and isinstance(obj['discriminator'], dict):
         d_sd = _strip_module_prefix(obj['discriminator'])
-        missing, unexpected = model.discriminator.load_state_dict(d_sd, strict=False)
+        missing, unexpected, _ = _safe_partial_load(model.discriminator, d_sd, module_name='ACGAN(discriminator)')
         loaded_any = True
         print(f"ACGAN(discriminator) loaded: missing={len(missing)}, unexpected={len(unexpected)}")
 
     if not loaded_any:
-        missing, unexpected = model.load_state_dict(candidate, strict=False)
+        missing, unexpected, _ = _safe_partial_load(model, candidate, module_name='ACGAN(fallback)')
         print(f"ACGAN(fallback) loaded: missing={len(missing)}, unexpected={len(unexpected)}")
 
     return model
