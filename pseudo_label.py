@@ -2244,6 +2244,8 @@ def main(data, outdir, network_pkl, feature_backbone, compare_diffusion_gan_pseu
             raise click.ClickException("ACGAN features are required for --compare_diffusion_gan_pseudo")
 
         print("\n=== Start comparison: diffusion features vs ACGAN features ===")
+        if compare_spectral_pseudo:
+            print("Spectral comparison is enabled for each feature space (diffusion/acgan).")
         comparison_results = {}
         cache = {}
         for space_name, lf, uf in [
@@ -2251,7 +2253,7 @@ def main(data, outdir, network_pkl, feature_backbone, compare_diffusion_gan_pseu
             ('acgan', acgan_labeled_features, acgan_unlabeled_features),
         ]:
             space_vis = os.path.join(outdir, f'clustering_quality_analysis_{space_name}.png') if visualize_clustering else None
-            pl, centers, c2l = perform_clustering_and_pseudo_labeling(
+            pl_latent, centers_latent, c2l_latent = perform_clustering_and_pseudo_labeling(
                 lf, labeled_labels, uf,
                 num_classes=num_classes,
                 save_visualization=space_vis,
@@ -2262,17 +2264,78 @@ def main(data, outdir, network_pkl, feature_backbone, compare_diffusion_gan_pseu
                 use_separate_clustering=use_separate_clustering,
                 unlabeled_n_clusters=unlabeled_n_clusters
             )
-            ev = evaluate_pseudo_label_assignment(pl, unlabeled_labels)
-            comparison_results[space_name] = ev
-            cache[space_name] = (pl, centers, c2l)
-            print(f"[{space_name}] acc={ev['accuracy']:.4f}, valid={ev['valid_count']}/{ev['total_count']}, discard={ev['discard_rate']:.4f}")
+            ev_latent = evaluate_pseudo_label_assignment(pl_latent, unlabeled_labels)
 
-        if comparison_results['acgan']['accuracy'] > comparison_results['diffusion']['accuracy']:
+            selected_repr = 'latent'
+            selected_pl, selected_centers, selected_c2l = pl_latent, centers_latent, c2l_latent
+            ev_selected = ev_latent
+            ev_spectral = None
+            spectral_meta = None
+
+            if compare_spectral_pseudo:
+                labeled_spec, unlabeled_spec, spectral_meta = build_spectral_features_joint(
+                    labeled_features=lf,
+                    unlabeled_features=uf,
+                    knn_k=spectral_compare_k,
+                    tau=spectral_compare_tau,
+                    spectral_dim=spectral_compare_dim,
+                    drop_first_eigvec=(not spectral_compare_keep_first_eigvec),
+                )
+                space_spec_vis = os.path.join(outdir, f'clustering_quality_analysis_{space_name}_spectral.png') if visualize_clustering else None
+                pl_spectral, centers_spectral, c2l_spectral = perform_clustering_and_pseudo_labeling(
+                    labeled_spec, labeled_labels, unlabeled_spec,
+                    num_classes=num_classes,
+                    save_visualization=space_spec_vis,
+                    similarity_method=similarity_method,
+                    cosine_threshold=cosine_threshold,
+                    distance_threshold=distance_threshold,
+                    device=device,
+                    use_separate_clustering=use_separate_clustering,
+                    unlabeled_n_clusters=unlabeled_n_clusters
+                )
+                ev_spectral = evaluate_pseudo_label_assignment(pl_spectral, unlabeled_labels)
+
+                if (ev_spectral['accuracy'] > ev_latent['accuracy']) or (
+                        ev_spectral['accuracy'] == ev_latent['accuracy'] and
+                        ev_spectral['discard_rate'] < ev_latent['discard_rate']):
+                    selected_repr = 'spectral'
+                    selected_pl, selected_centers, selected_c2l = pl_spectral, centers_spectral, c2l_spectral
+                    ev_selected = ev_spectral
+
+            if compare_spectral_pseudo:
+                comparison_results[space_name] = {
+                    'selected_representation': selected_repr,
+                    'selected': ev_selected,
+                    'latent': ev_latent,
+                    'spectral': ev_spectral,
+                    'spectral_graph': spectral_meta,
+                }
+                print(
+                    f"[{space_name}] latent acc={ev_latent['accuracy']:.4f}, spectral acc={ev_spectral['accuracy']:.4f}, "
+                    f"selected={selected_repr} (acc={ev_selected['accuracy']:.4f}, discard={ev_selected['discard_rate']:.4f})"
+                )
+            else:
+                comparison_results[space_name] = ev_selected
+                print(
+                    f"[{space_name}] acc={ev_selected['accuracy']:.4f}, "
+                    f"valid={ev_selected['valid_count']}/{ev_selected['total_count']}, discard={ev_selected['discard_rate']:.4f}"
+                )
+
+            cache[space_name] = (selected_pl, selected_centers, selected_c2l)
+
+        if compare_spectral_pseudo:
+            acgan_best = comparison_results['acgan']['selected']
+            diffusion_best = comparison_results['diffusion']['selected']
+        else:
+            acgan_best = comparison_results['acgan']
+            diffusion_best = comparison_results['diffusion']
+
+        if acgan_best['accuracy'] > diffusion_best['accuracy']:
             selected_space = 'acgan'
-        elif comparison_results['acgan']['accuracy'] < comparison_results['diffusion']['accuracy']:
+        elif acgan_best['accuracy'] < diffusion_best['accuracy']:
             selected_space = 'diffusion'
         else:
-            selected_space = 'acgan' if comparison_results['acgan']['discard_rate'] < comparison_results['diffusion']['discard_rate'] else 'diffusion'
+            selected_space = 'acgan' if acgan_best['discard_rate'] < diffusion_best['discard_rate'] else 'diffusion'
 
         pseudo_labels, cluster_centers, cluster_to_label = cache[selected_space]
         comparison_path = os.path.join(outdir, 'diffusion_vs_acgan_pseudo_comparison.json')
@@ -2283,6 +2346,11 @@ def main(data, outdir, network_pkl, feature_backbone, compare_diffusion_gan_pseu
                 'acgan': comparison_results['acgan'],
                 'settings': {
                     'acgan_layer': acgan_layer,
+                    'compare_spectral_pseudo': bool(compare_spectral_pseudo),
+                    'spectral_compare_k': int(spectral_compare_k),
+                    'spectral_compare_tau': float(spectral_compare_tau),
+                    'spectral_compare_dim': int(spectral_compare_dim),
+                    'spectral_compare_keep_first_eigvec': bool(spectral_compare_keep_first_eigvec),
                     'similarity_method': similarity_method,
                     'cosine_threshold': cosine_threshold,
                     'distance_threshold': distance_threshold,
