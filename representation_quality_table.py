@@ -164,21 +164,63 @@ def extract_diffusion_features_batched(
 def extract_acgan_features_batched(
     acgan_model,
     images: np.ndarray,
+    labels: Optional[np.ndarray],
     layer: str,
+    network: str,
     batch_size: int,
     device: str,
     desc: str,
 ) -> np.ndarray:
+    network = network.strip().lower()
+    if network not in {"generator", "discriminator"}:
+        raise ValueError(f"Unsupported ACGAN feature network: {network}")
+    if network == "generator" and labels is None:
+        raise ValueError("labels are required when extracting generator features")
+
     all_feats = []
     total_batches = (len(images) + batch_size - 1) // batch_size
     for i in tqdm(range(0, len(images), batch_size), total=total_batches, desc=desc):
         batch_images = images[i : i + batch_size]
-        batch_feat = extract_features_with_acgan(
-            acgan_model=acgan_model,
-            images=batch_images,
-            layer=layer,
-            device=device,
-        )
+        batch_labels = labels[i : i + batch_size] if labels is not None else None
+        if network == "discriminator":
+            batch_feat = extract_features_with_acgan(
+                acgan_model=acgan_model,
+                images=batch_images,
+                layer=layer,
+                device=device,
+            )
+        else:
+            latent_dim = int(getattr(acgan_model, "latent_dim", 100))
+            batch_noise = image_to_pixel_features(batch_images)
+            if batch_noise.max() <= 1.0:
+                batch_noise = batch_noise * 2.0 - 1.0
+            else:
+                batch_noise = batch_noise / 127.5 - 1.0
+            batch_noise = batch_noise - batch_noise.mean(axis=1, keepdims=True)
+            batch_noise_std = np.std(batch_noise, axis=1, keepdims=True)
+            batch_noise = batch_noise / np.maximum(batch_noise_std, 1e-6)
+            if batch_noise.shape[1] < latent_dim:
+                pad_dim = latent_dim - batch_noise.shape[1]
+                batch_noise = np.pad(batch_noise, ((0, 0), (0, pad_dim)), mode="constant")
+            elif batch_noise.shape[1] > latent_dim:
+                batch_noise = batch_noise[:, :latent_dim]
+
+            label_tensor = torch.as_tensor(batch_labels, dtype=torch.long, device=device)
+            if label_tensor.ndim > 1:
+                label_tensor = torch.argmax(label_tensor, dim=1)
+            noise_tensor = torch.as_tensor(batch_noise, dtype=torch.float32, device=device)
+            with torch.no_grad():
+                batch_feat_tensor = acgan_model.extract_features(
+                    network="generator",
+                    noise=noise_tensor,
+                    labels=label_tensor,
+                    layer=layer,
+                    detach=True,
+                )
+            if batch_feat_tensor.ndim > 2:
+                batch_feat_tensor = batch_feat_tensor.view(batch_feat_tensor.shape[0], -1)
+            batch_feat = batch_feat_tensor.detach().cpu().numpy()
+
         all_feats.append(batch_feat)
     return np.concatenate(all_feats, axis=0).astype(np.float32)
 
@@ -284,6 +326,13 @@ def generate_latex_table(metrics_by_space: Dict[str, Optional[Dict[str, float]]]
 @click.option("--acgan_ckpt", type=str, default="", show_default=False, help="Optional, enables GAN spectral row")
 @click.option("--acgan_layer", type=str, default="flatten", show_default=True)
 @click.option(
+    "--acgan_feature_network",
+    type=click.Choice(["generator", "discriminator"]),
+    default="generator",
+    show_default=True,
+    help="Use generator or discriminator features when building GAN spectral row.",
+)
+@click.option(
     "--classifier_features_npz",
     type=str,
     default="",
@@ -314,6 +363,7 @@ def main(
     network_pkl: str,
     acgan_ckpt: str,
     acgan_layer: str,
+    acgan_feature_network: str,
     classifier_features_npz: str,
     outdir: str,
     max_images: int,
@@ -460,6 +510,10 @@ def main(
     gan_graph_meta = None
     if acgan_ckpt:
         print("=== 5) GAN spectral metrics ===")
+        if acgan_feature_network == "generator" and acgan_layer == "flatten":
+            print("acgan_layer='flatten' is discriminator-oriented. Switch to generator layer='reshape'.")
+            acgan_layer = "reshape"
+        print(f"use ACGAN {acgan_feature_network} features from layer: {acgan_layer}")
         num_classes = 10 if dataset_type in ["cifar10", "fashion-mnist", "mnist", "svhn", "stl10"] else 100
         img_size = int(images.shape[2]) if images.ndim == 4 else 32
         img_channels = 1 if dataset_type in ["mnist", "fashion-mnist"] else 3
@@ -474,7 +528,9 @@ def main(
         gan_labeled_feat = extract_acgan_features_batched(
             acgan_model=acgan_model,
             images=labeled_images,
+            labels=labeled_labels,
             layer=acgan_layer,
+            network=acgan_feature_network,
             batch_size=batch_size,
             device=device,
             desc="ACGAN labeled",
@@ -482,7 +538,9 @@ def main(
         gan_eval_feat = extract_acgan_features_batched(
             acgan_model=acgan_model,
             images=eval_images,
+            labels=eval_labels,
             layer=acgan_layer,
+            network=acgan_feature_network,
             batch_size=batch_size,
             device=device,
             desc="ACGAN eval",
@@ -527,6 +585,8 @@ def main(
             "spectral_tau": float(spectral_tau),
             "spectral_dim": int(spectral_dim),
             "spectral_keep_first_eigvec": bool(spectral_keep_first_eigvec),
+            "acgan_layer": acgan_layer,
+            "acgan_feature_network": acgan_feature_network,
             "knn_k": int(knn_k),
             "silhouette_max_samples": int(silhouette_max_samples),
             "l2_normalize_features": bool(l2_normalize_features),
@@ -566,3 +626,13 @@ def main(
 if __name__ == "__main__":
     main()
 
+'''
+python edm-temp/representation_quality_table.py \
+  --data <数据集路径> \
+  --dataset_type cifar10 \
+  --network_pkl <扩散模型pkl路径> \
+  --outdir representation_quality_output \
+  --classifier_features_npz 
+
+
+'''
