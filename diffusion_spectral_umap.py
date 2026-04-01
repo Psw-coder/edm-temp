@@ -273,64 +273,54 @@ def _scatter_with_label_style(
 
 
 def save_visualization(
-    diffusion_umap: np.ndarray,
-    spectral_umap: np.ndarray,
+    embedding_2d: np.ndarray,
     labels: np.ndarray,
     is_labeled: Optional[np.ndarray],
+    title: str,
     out_path: str,
+    show_legend: bool,
 ):
     unique_labels = np.unique(labels)
     cmap = "tab10" if unique_labels.size <= 10 else "tab20"
     vmin = int(unique_labels.min())
     vmax = int(unique_labels.max())
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig, ax = plt.subplots(1, 1, figsize=(7.5, 6))
 
     _scatter_with_label_style(
-        ax=axes[0],
-        embedding_2d=diffusion_umap,
+        ax=ax,
+        embedding_2d=embedding_2d,
         labels=labels,
         is_labeled=is_labeled,
         cmap=cmap,
     )
-    axes[0].set_title("UMAP of diffusion latent $h_i^{diff}$")
-    axes[0].set_xlabel("UMAP-1")
-    axes[0].set_ylabel("UMAP-2")
-    axes[0].grid(alpha=0.2)
+    ax.set_title(title)
+    ax.set_xlabel("UMAP-1")
+    ax.set_ylabel("UMAP-2")
+    ax.grid(alpha=0.2)
 
-    _scatter_with_label_style(
-        ax=axes[1],
-        embedding_2d=spectral_umap,
-        labels=labels,
-        is_labeled=is_labeled,
-        cmap=cmap,
-    )
-    axes[1].set_title("UMAP of spectral embedding $e_i^{spec}$")
-    axes[1].set_xlabel("UMAP-1")
-    axes[1].set_ylabel("UMAP-2")
-    axes[1].grid(alpha=0.2)
+    if show_legend:
+        norm = plt.Normalize(vmin=vmin, vmax=vmax)
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, shrink=0.92, pad=0.02)
+        cbar.set_label("Class label")
 
-    norm = plt.Normalize(vmin=vmin, vmax=vmax)
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=axes, shrink=0.92, pad=0.02)
-    cbar.set_label("Class label")
-
-    if is_labeled is not None:
-        legend_handles = [
-            Line2D([0], [0], marker="o", color="w", label="Unlabeled", markerfacecolor="gray", markersize=7),
-            Line2D(
-                [0],
-                [0],
-                marker="*",
-                color="w",
-                label="Labeled",
-                markerfacecolor="gray",
-                markeredgecolor="black",
-                markersize=11,
-            ),
-        ]
-        axes[1].legend(handles=legend_handles, loc="best")
+        if is_labeled is not None:
+            legend_handles = [
+                Line2D([0], [0], marker="o", color="w", label="Unlabeled", markerfacecolor="gray", markersize=7),
+                Line2D(
+                    [0],
+                    [0],
+                    marker="*",
+                    color="w",
+                    label="Labeled",
+                    markerfacecolor="gray",
+                    markeredgecolor="black",
+                    markersize=11,
+                ),
+            ]
+            ax.legend(handles=legend_handles, loc="best")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=300)
@@ -426,6 +416,11 @@ def parse_args():
     )
     parser.add_argument("--umap_neighbors", type=int, default=30, help="UMAP n_neighbors.")
     parser.add_argument("--umap_min_dist", type=float, default=0.1, help="UMAP min_dist.")
+    parser.add_argument(
+        "--no_legend",
+        action="store_true",
+        help="Disable plot legends (class colorbar and labeled/unlabeled marker legend).",
+    )
     parser.add_argument("--metric_knn_k", type=int, default=10, help="k for kNN label consistency metric.")
     parser.add_argument("--random_seed", type=int, default=42, help="Random seed.")
     return parser.parse_args()
@@ -489,15 +484,26 @@ def main():
         min_dist=args.umap_min_dist,
         random_seed=args.random_seed,
     )
-    fig_path = os.path.join(args.output_dir, "umap_diffusion_vs_spectral.png")
+    diffusion_fig_path = os.path.join(args.output_dir, "umap_diffusion.png")
+    spectral_fig_path = os.path.join(args.output_dir, "umap_spectral.png")
     save_visualization(
-        diffusion_umap=diffusion_umap,
-        spectral_umap=spectral_umap,
+        embedding_2d=diffusion_umap,
         labels=labels,
         is_labeled=is_labeled,
-        out_path=fig_path,
+        title="UMAP of diffusion latent $h_i^{diff}$",
+        out_path=diffusion_fig_path,
+        show_legend=(not args.no_legend),
     )
-    print(f"Visualization saved to: {fig_path}")
+    save_visualization(
+        embedding_2d=spectral_umap,
+        labels=labels,
+        is_labeled=is_labeled,
+        title="UMAP of spectral embedding $e_i^{spec}$",
+        out_path=spectral_fig_path,
+        show_legend=(not args.no_legend),
+    )
+    print(f"Visualization saved to: {diffusion_fig_path}")
+    print(f"Visualization saved to: {spectral_fig_path}")
 
     metrics = {
         "diffusion_latent_l2": compute_quality_metrics(features_l2, labels, knn_k=args.metric_knn_k),
