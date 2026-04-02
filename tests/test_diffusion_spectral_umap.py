@@ -51,6 +51,20 @@ class DiffusionSpectralUmapArgsTest(unittest.TestCase):
         self.assertTrue(args.fill_class_regions)
         self.assertEqual(args.region_alpha, 0.25)
 
+    def test_parse_args_uses_visible_default_region_alpha(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "diffusion_spectral_umap.py",
+                "--input",
+                "dummy.npz",
+            ],
+        ):
+            args = dsu.parse_args()
+
+        self.assertGreaterEqual(args.region_alpha, 0.3)
+
     def test_parse_args_rejects_removed_region_expand_ratio_option(self):
         with mock.patch.object(
             sys,
@@ -68,6 +82,13 @@ class DiffusionSpectralUmapArgsTest(unittest.TestCase):
 
 
 class DiffusionSpectralUmapBackgroundTest(unittest.TestCase):
+    def test_lighten_rgba_keeps_background_visibly_tinted(self):
+        color = (0.1216, 0.4667, 0.7059, 1.0)
+
+        lightened = dsu._lighten_rgba(color, dsu.DEFAULT_REGION_LIGHTEN_RATIO)
+
+        self.assertLess(max(lightened[:3]), 0.9)
+
     def test_compute_background_labels_uses_nearest_class_centers(self):
         embedding_2d = np.array(
             [

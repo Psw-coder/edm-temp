@@ -20,6 +20,8 @@ except ImportError:
 CM_PER_INCH = 2.54
 DEFAULT_FIGURE_WIDTH_CM = 7.2 * CM_PER_INCH
 DEFAULT_FIGURE_HEIGHT_CM = 5.8 * CM_PER_INCH
+DEFAULT_REGION_ALPHA = 0.4
+DEFAULT_REGION_LIGHTEN_RATIO = 0.5
 
 
 def _lighten_rgba(color: Tuple[float, float, float, float], blend_ratio: float) -> Tuple[float, float, float, float]:
@@ -63,7 +65,10 @@ def _draw_class_regions(
         np.linspace(y_limits[0], y_limits[1], 300, dtype=np.float32),
     )
     background_labels = _compute_background_labels(embedding_2d, labels, x_grid, y_grid)
-    region_colors = [_lighten_rgba(colormap(norm(int(label))), blend_ratio=0.78) for label in unique_labels]
+    region_colors = [
+        _lighten_rgba(colormap(norm(int(label))), blend_ratio=DEFAULT_REGION_LIGHTEN_RATIO)
+        for label in unique_labels
+    ]
 
     ax.contourf(
         x_grid,
@@ -529,7 +534,7 @@ def parse_args():
     parser.add_argument(
         "--region_alpha",
         type=float,
-        default=0.18,
+        default=DEFAULT_REGION_ALPHA,
         help="Alpha for filled class regions.",
     )
     parser.add_argument(
