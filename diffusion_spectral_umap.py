@@ -8,6 +8,7 @@ import numpy as np
 from matplotlib.lines import Line2D
 from scipy import sparse
 from scipy.sparse.linalg import eigsh
+from scipy.spatial import ConvexHull, QhullError
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 from sklearn.neighbors import NearestNeighbors
 
@@ -15,6 +16,65 @@ try:
     import umap
 except ImportError:
     umap = None
+
+
+CM_PER_INCH = 2.54
+DEFAULT_FIGURE_WIDTH_CM = 7.2 * CM_PER_INCH
+DEFAULT_FIGURE_HEIGHT_CM = 5.8 * CM_PER_INCH
+
+
+def _lighten_rgba(color: Tuple[float, float, float, float], blend_ratio: float) -> Tuple[float, float, float, float]:
+    blend_ratio = float(np.clip(blend_ratio, 0.0, 1.0))
+    rgb = np.asarray(color[:3], dtype=np.float32)
+    light_rgb = rgb * (1.0 - blend_ratio) + blend_ratio
+    return float(light_rgb[0]), float(light_rgb[1]), float(light_rgb[2]), 1.0
+
+
+def _draw_class_regions(
+    ax: plt.Axes,
+    embedding_2d: np.ndarray,
+    labels: np.ndarray,
+    unique_labels: np.ndarray,
+    cmap: str,
+    vmin: int,
+    vmax: int,
+    region_alpha: float,
+    region_expand_ratio: float,
+):
+    if unique_labels.size == 0:
+        return
+
+    norm = plt.Normalize(vmin=vmin, vmax=vmax)
+    colormap = plt.get_cmap(cmap)
+
+    for label in unique_labels:
+        class_points = embedding_2d[labels == label]
+        if class_points.shape[0] < 3:
+            continue
+
+        centered_points = class_points - np.mean(class_points, axis=0, keepdims=True)
+        if np.linalg.matrix_rank(centered_points) < 2:
+            continue
+
+        try:
+            hull = ConvexHull(class_points)
+        except QhullError:
+            continue
+
+        hull_points = class_points[hull.vertices]
+        center = np.mean(hull_points, axis=0, keepdims=True)
+        expanded_hull_points = center + (hull_points - center) * (1.0 + max(region_expand_ratio, 0.0))
+
+        region_color = _lighten_rgba(colormap(norm(int(label))), blend_ratio=0.78)
+        ax.fill(
+            expanded_hull_points[:, 0],
+            expanded_hull_points[:, 1],
+            facecolor=region_color,
+            edgecolor="white",
+            linewidth=0.6,
+            alpha=region_alpha,
+            zorder=0,
+        )
 
 
 def load_feature_pack(input_path: str, metadata_path: Optional[str]) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
@@ -237,8 +297,8 @@ def _scatter_with_label_style(
             embedding_2d[:, 1],
             c=labels,
             cmap=cmap,
-            s=10,
-            alpha=0.75,
+            s=20,
+            alpha=0.8,
             linewidths=0,
         )
         return
@@ -252,8 +312,8 @@ def _scatter_with_label_style(
             embedding_2d[unlabeled_mask, 1],
             c=labels[unlabeled_mask],
             cmap=cmap,
-            s=10,
-            alpha=0.55,
+            s=18,
+            alpha=0.62,
             marker="o",
             linewidths=0,
         )
@@ -264,11 +324,11 @@ def _scatter_with_label_style(
             embedding_2d[labeled_mask, 1],
             c=labels[labeled_mask],
             cmap=cmap,
-            s=45,
+            s=78,
             alpha=0.95,
             marker="*",
             edgecolors="black",
-            linewidths=0.4,
+            linewidths=0.5,
         )
 
 
@@ -279,13 +339,35 @@ def save_visualization(
     title: str,
     out_path: str,
     show_legend: bool,
+    figure_width_cm: float,
+    figure_height_cm: float,
+    fill_class_regions: bool,
+    region_alpha: float,
+    region_expand_ratio: float,
 ):
     unique_labels = np.unique(labels)
     cmap = "tab10" if unique_labels.size <= 10 else "tab20"
     vmin = int(unique_labels.min())
     vmax = int(unique_labels.max())
 
-    fig, ax = plt.subplots(1, 1, figsize=(7.5, 6))
+    fig, ax = plt.subplots(
+        1,
+        1,
+        figsize=(figure_width_cm / CM_PER_INCH, figure_height_cm / CM_PER_INCH),
+    )
+
+    if fill_class_regions:
+        _draw_class_regions(
+            ax=ax,
+            embedding_2d=embedding_2d,
+            labels=labels,
+            unique_labels=unique_labels,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            region_alpha=region_alpha,
+            region_expand_ratio=region_expand_ratio,
+        )
 
     _scatter_with_label_style(
         ax=ax,
@@ -294,16 +376,27 @@ def save_visualization(
         is_labeled=is_labeled,
         cmap=cmap,
     )
-    ax.set_title(title)
-    ax.set_xlabel("UMAP-1")
-    ax.set_ylabel("UMAP-2")
+    x = embedding_2d[:, 0]
+    y = embedding_2d[:, 1]
+    x_span = float(np.max(x) - np.min(x))
+    y_span = float(np.max(y) - np.min(y))
+    x_pad = max(x_span * 0.01, 1e-6)
+    y_pad = max(y_span * 0.01, 1e-6)
+    ax.set_xlim(float(np.min(x) - x_pad), float(np.max(x) + x_pad))
+    ax.set_ylim(float(np.min(y) - y_pad), float(np.max(y) + y_pad))
+
+    ax.set_title(title, fontsize=12)
+    ax.set_xlabel("UMAP-1", fontsize=11)
+    ax.set_ylabel("UMAP-2", fontsize=11)
+    ax.tick_params(labelsize=10)
     ax.grid(alpha=0.2)
+    ax.margins(x=0, y=0)
 
     if show_legend:
         norm = plt.Normalize(vmin=vmin, vmax=vmax)
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
-        cbar = fig.colorbar(sm, ax=ax, shrink=0.92, pad=0.02)
+        cbar = fig.colorbar(sm, ax=ax, shrink=0.96, pad=0.015)
         cbar.set_label("Class label")
 
         if is_labeled is not None:
@@ -322,8 +415,8 @@ def save_visualization(
             ]
             ax.legend(handles=legend_handles, loc="best")
 
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=300)
+    fig.tight_layout(pad=0.08)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.01)
     plt.close(fig)
 
 
@@ -417,6 +510,35 @@ def parse_args():
     parser.add_argument("--umap_neighbors", type=int, default=30, help="UMAP n_neighbors.")
     parser.add_argument("--umap_min_dist", type=float, default=0.1, help="UMAP min_dist.")
     parser.add_argument(
+        "--figure_width_cm",
+        type=float,
+        default=DEFAULT_FIGURE_WIDTH_CM,
+        help="Saved figure width in centimeters.",
+    )
+    parser.add_argument(
+        "--figure_height_cm",
+        type=float,
+        default=DEFAULT_FIGURE_HEIGHT_CM,
+        help="Saved figure height in centimeters.",
+    )
+    parser.add_argument(
+        "--fill_class_regions",
+        action="store_true",
+        help="Fill a light convex-hull background region behind each class cluster.",
+    )
+    parser.add_argument(
+        "--region_alpha",
+        type=float,
+        default=0.18,
+        help="Alpha for filled class regions.",
+    )
+    parser.add_argument(
+        "--region_expand_ratio",
+        type=float,
+        default=0.08,
+        help="Relative outward expansion ratio for convex-hull class regions.",
+    )
+    parser.add_argument(
         "--no_legend",
         action="store_true",
         help="Disable plot legends (class colorbar and labeled/unlabeled marker legend).",
@@ -493,6 +615,11 @@ def main():
         title="UMAP of diffusion latent $h_i^{diff}$",
         out_path=diffusion_fig_path,
         show_legend=(not args.no_legend),
+        figure_width_cm=args.figure_width_cm,
+        figure_height_cm=args.figure_height_cm,
+        fill_class_regions=args.fill_class_regions,
+        region_alpha=args.region_alpha,
+        region_expand_ratio=args.region_expand_ratio,
     )
     save_visualization(
         embedding_2d=spectral_umap,
@@ -501,6 +628,11 @@ def main():
         title="UMAP of spectral embedding $e_i^{spec}$",
         out_path=spectral_fig_path,
         show_legend=(not args.no_legend),
+        figure_width_cm=args.figure_width_cm,
+        figure_height_cm=args.figure_height_cm,
+        fill_class_regions=args.fill_class_regions,
+        region_alpha=args.region_alpha,
+        region_expand_ratio=args.region_expand_ratio,
     )
     print(f"Visualization saved to: {diffusion_fig_path}")
     print(f"Visualization saved to: {spectral_fig_path}")
@@ -535,3 +667,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+'''
+python diffusion_spectral_umap.py \
+  --input pseudo_label_output_cifar10/all_features.npz   \
+  --output_dir spectral_analysis_output_cifar10
+
+
+python diffusion_spectral_umap.py   --input pseudo_label_output_mnist/all_features.npz     \
+--output_dir spectral_analysis_output_mnist \
+--k 15 \
+--spectral_dim 12
+'''
