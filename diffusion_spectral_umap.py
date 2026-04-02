@@ -8,7 +8,6 @@ import numpy as np
 from matplotlib.lines import Line2D
 from scipy import sparse
 from scipy.sparse.linalg import eigsh
-from scipy.spatial import ConvexHull, QhullError
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 from sklearn.neighbors import NearestNeighbors
 
@@ -30,51 +29,52 @@ def _lighten_rgba(color: Tuple[float, float, float, float], blend_ratio: float) 
     return float(light_rgb[0]), float(light_rgb[1]), float(light_rgb[2]), 1.0
 
 
+def _compute_background_labels(
+    embedding_2d: np.ndarray,
+    labels: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+) -> np.ndarray:
+    unique_labels = np.unique(labels)
+    class_centers = np.stack([embedding_2d[labels == label].mean(axis=0) for label in unique_labels], axis=0)
+
+    grid_points = np.stack([x_grid, y_grid], axis=-1)
+    distances_sq = np.sum((grid_points[..., None, :] - class_centers[None, None, :, :]) ** 2, axis=-1)
+    return np.argmin(distances_sq, axis=-1).astype(np.int64)
+
+
 def _draw_class_regions(
     ax: plt.Axes,
     embedding_2d: np.ndarray,
     labels: np.ndarray,
     unique_labels: np.ndarray,
     cmap: str,
-    vmin: int,
-    vmax: int,
+    x_limits: Tuple[float, float],
+    y_limits: Tuple[float, float],
     region_alpha: float,
-    region_expand_ratio: float,
 ):
-    if unique_labels.size == 0:
+    if unique_labels.size == 0 or region_alpha <= 0:
         return
 
-    norm = plt.Normalize(vmin=vmin, vmax=vmax)
+    norm = plt.Normalize(vmin=int(unique_labels.min()), vmax=int(unique_labels.max()))
     colormap = plt.get_cmap(cmap)
+    x_grid, y_grid = np.meshgrid(
+        np.linspace(x_limits[0], x_limits[1], 300, dtype=np.float32),
+        np.linspace(y_limits[0], y_limits[1], 300, dtype=np.float32),
+    )
+    background_labels = _compute_background_labels(embedding_2d, labels, x_grid, y_grid)
+    region_colors = [_lighten_rgba(colormap(norm(int(label))), blend_ratio=0.78) for label in unique_labels]
 
-    for label in unique_labels:
-        class_points = embedding_2d[labels == label]
-        if class_points.shape[0] < 3:
-            continue
-
-        centered_points = class_points - np.mean(class_points, axis=0, keepdims=True)
-        if np.linalg.matrix_rank(centered_points) < 2:
-            continue
-
-        try:
-            hull = ConvexHull(class_points)
-        except QhullError:
-            continue
-
-        hull_points = class_points[hull.vertices]
-        center = np.mean(hull_points, axis=0, keepdims=True)
-        expanded_hull_points = center + (hull_points - center) * (1.0 + max(region_expand_ratio, 0.0))
-
-        region_color = _lighten_rgba(colormap(norm(int(label))), blend_ratio=0.78)
-        ax.fill(
-            expanded_hull_points[:, 0],
-            expanded_hull_points[:, 1],
-            facecolor=region_color,
-            edgecolor="white",
-            linewidth=0.6,
-            alpha=region_alpha,
-            zorder=0,
-        )
+    ax.contourf(
+        x_grid,
+        y_grid,
+        background_labels,
+        levels=np.arange(unique_labels.size + 1) - 0.5,
+        colors=region_colors,
+        alpha=region_alpha,
+        antialiased=True,
+        zorder=0,
+    )
 
 
 def load_feature_pack(input_path: str, metadata_path: Optional[str]) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
@@ -343,12 +343,19 @@ def save_visualization(
     figure_height_cm: float,
     fill_class_regions: bool,
     region_alpha: float,
-    region_expand_ratio: float,
 ):
     unique_labels = np.unique(labels)
     cmap = "tab10" if unique_labels.size <= 10 else "tab20"
     vmin = int(unique_labels.min())
     vmax = int(unique_labels.max())
+    x = embedding_2d[:, 0]
+    y = embedding_2d[:, 1]
+    x_span = float(np.max(x) - np.min(x))
+    y_span = float(np.max(y) - np.min(y))
+    x_pad = max(x_span * 0.01, 1e-6)
+    y_pad = max(y_span * 0.01, 1e-6)
+    x_limits = (float(np.min(x) - x_pad), float(np.max(x) + x_pad))
+    y_limits = (float(np.min(y) - y_pad), float(np.max(y) + y_pad))
 
     fig, ax = plt.subplots(
         1,
@@ -363,10 +370,9 @@ def save_visualization(
             labels=labels,
             unique_labels=unique_labels,
             cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
+            x_limits=x_limits,
+            y_limits=y_limits,
             region_alpha=region_alpha,
-            region_expand_ratio=region_expand_ratio,
         )
 
     _scatter_with_label_style(
@@ -376,14 +382,8 @@ def save_visualization(
         is_labeled=is_labeled,
         cmap=cmap,
     )
-    x = embedding_2d[:, 0]
-    y = embedding_2d[:, 1]
-    x_span = float(np.max(x) - np.min(x))
-    y_span = float(np.max(y) - np.min(y))
-    x_pad = max(x_span * 0.01, 1e-6)
-    y_pad = max(y_span * 0.01, 1e-6)
-    ax.set_xlim(float(np.min(x) - x_pad), float(np.max(x) + x_pad))
-    ax.set_ylim(float(np.min(y) - y_pad), float(np.max(y) + y_pad))
+    ax.set_xlim(*x_limits)
+    ax.set_ylim(*y_limits)
 
     ax.set_title(title, fontsize=12)
     ax.set_xlabel("UMAP-1", fontsize=11)
@@ -524,19 +524,13 @@ def parse_args():
     parser.add_argument(
         "--fill_class_regions",
         action="store_true",
-        help="Fill a light convex-hull background region behind each class cluster.",
+        help="Fill the plot background with light nearest-class regions.",
     )
     parser.add_argument(
         "--region_alpha",
         type=float,
         default=0.18,
         help="Alpha for filled class regions.",
-    )
-    parser.add_argument(
-        "--region_expand_ratio",
-        type=float,
-        default=0.08,
-        help="Relative outward expansion ratio for convex-hull class regions.",
     )
     parser.add_argument(
         "--no_legend",
@@ -619,7 +613,6 @@ def main():
         figure_height_cm=args.figure_height_cm,
         fill_class_regions=args.fill_class_regions,
         region_alpha=args.region_alpha,
-        region_expand_ratio=args.region_expand_ratio,
     )
     save_visualization(
         embedding_2d=spectral_umap,
@@ -632,7 +625,6 @@ def main():
         figure_height_cm=args.figure_height_cm,
         fill_class_regions=args.fill_class_regions,
         region_alpha=args.region_alpha,
-        region_expand_ratio=args.region_expand_ratio,
     )
     print(f"Visualization saved to: {diffusion_fig_path}")
     print(f"Visualization saved to: {spectral_fig_path}")
