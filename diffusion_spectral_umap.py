@@ -82,6 +82,53 @@ def _draw_class_regions(
     )
 
 
+def _build_label_state_legend_handles():
+    return [
+        Line2D([0], [0], marker="o", color="w", label="Unlabeled", markerfacecolor="gray", markersize=7),
+        Line2D(
+            [0],
+            [0],
+            marker="*",
+            color="w",
+            label="Labeled",
+            markerfacecolor="gray",
+            markeredgecolor="black",
+            markersize=11,
+        ),
+    ]
+
+
+def _apply_plot_text(ax: plt.Axes, title: str, show_legend: bool):
+    if show_legend:
+        ax.set_title(title, fontsize=12)
+        ax.set_xlabel("UMAP-1", fontsize=11)
+        ax.set_ylabel("UMAP-2", fontsize=11)
+    else:
+        ax.set_title("")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+
+
+def _apply_auxiliary_artists(
+    fig: plt.Figure,
+    ax: plt.Axes,
+    show_legend: bool,
+    is_labeled: Optional[np.ndarray],
+    cmap: str,
+    vmin: int,
+    vmax: int,
+):
+    if show_legend:
+        norm = plt.Normalize(vmin=vmin, vmax=vmax)
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, shrink=0.96, pad=0.015)
+        cbar.set_label("Class label")
+
+    if is_labeled is not None:
+        ax.legend(handles=_build_label_state_legend_handles(), loc="best")
+
+
 def load_feature_pack(input_path: str, metadata_path: Optional[str]) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     data = np.load(input_path)
     if "features" not in data or "labels" not in data:
@@ -390,35 +437,20 @@ def save_visualization(
     ax.set_xlim(*x_limits)
     ax.set_ylim(*y_limits)
 
-    ax.set_title(title, fontsize=12)
-    ax.set_xlabel("UMAP-1", fontsize=11)
-    ax.set_ylabel("UMAP-2", fontsize=11)
+    _apply_plot_text(ax=ax, title=title, show_legend=show_legend)
     ax.tick_params(labelsize=10)
     ax.grid(alpha=0.2)
     ax.margins(x=0, y=0)
 
-    if show_legend:
-        norm = plt.Normalize(vmin=vmin, vmax=vmax)
-        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-        sm.set_array([])
-        cbar = fig.colorbar(sm, ax=ax, shrink=0.96, pad=0.015)
-        cbar.set_label("Class label")
-
-        if is_labeled is not None:
-            legend_handles = [
-                Line2D([0], [0], marker="o", color="w", label="Unlabeled", markerfacecolor="gray", markersize=7),
-                Line2D(
-                    [0],
-                    [0],
-                    marker="*",
-                    color="w",
-                    label="Labeled",
-                    markerfacecolor="gray",
-                    markeredgecolor="black",
-                    markersize=11,
-                ),
-            ]
-            ax.legend(handles=legend_handles, loc="best")
+    _apply_auxiliary_artists(
+        fig=fig,
+        ax=ax,
+        show_legend=show_legend,
+        is_labeled=is_labeled,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+    )
 
     fig.tight_layout(pad=0.08)
     fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.01)
@@ -666,12 +698,18 @@ if __name__ == "__main__":
     main()
 '''
 python diffusion_spectral_umap.py \
-  --input pseudo_label_output_cifar10/all_features.npz   \
-  --output_dir spectral_analysis_output_cifar10
-
+  --input pseudo_label_output_cifar100/all_features.npz   \
+  --output_dir spectral_analysis_output_cifar100 \
+  --figure_width_cm 12 \
+  --figure_height_cm 10 \
+  --fill_class_regions \
+  --umap_min_dist 0.4 \
+  --no_legend
+ 
 
 python diffusion_spectral_umap.py   --input pseudo_label_output_mnist/all_features.npz     \
 --output_dir spectral_analysis_output_mnist \
 --k 15 \
 --spectral_dim 12
 '''
+
