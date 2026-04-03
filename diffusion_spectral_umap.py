@@ -126,7 +126,12 @@ def _apply_auxiliary_artists(
         cbar.set_label("Class label")
 
     if is_labeled is not None:
-        ax.legend(handles=_build_label_state_legend_handles(), loc="best")
+        ax.legend(
+        handles=_build_label_state_legend_handles(),
+        loc="upper right",
+        bbox_to_anchor=(0.02, 0.98),
+        borderaxespad=0.0,
+        )
 
 
 def load_feature_pack(input_path: str, metadata_path: Optional[str]) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:

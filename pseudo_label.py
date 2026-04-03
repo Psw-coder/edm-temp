@@ -1888,15 +1888,15 @@ def generate_sigma_schedule(sigma_min, sigma_max, num_steps, rho):
 '''
 @click.command()
 @click.option('--data', help='数据集tar.gz文件路径', metavar='PATH', type=str,
-              # default='/data/psw/edm/data')
+              default='/data/psw/edm/data/FashionMNIST')
               # default='/data/psw/edm/data/cifar-10-python.tar.gz')
               # default='/data/psw/DFLSemi/samples/cifar10')
-              default='/data/psw/DDPM/data/cifar-10-python.tar.gz')
+            #   default='/data/psw/DDPM/data/cifar-10-python.tar.gz')
 # default='/data/psw/DFLSemi_diffusion/samples/cifar100/cifar-100-python.tar.gz')
 @click.option('--outdir', help='输出目录', metavar='DIR', type=str, default='pseudo_label_output')
 @click.option('--network_pkl', help='预训练网络的pickle文件路径', metavar='PATH', type=str,
               # default='/data/psw/edm/checkpoint/edm-cifar10-32x32-uncond-vp.pkl')
-              default='/data/psw/edm/run/00013-stl10-uncond-ddpmpp-edm-gpus4-batch64-fp32/network-snapshot-042540.pkl')
+              default='/data/psw/edm/ckpt/network-snapshot-017856.pkl')
 @click.option('--feature_backbone', help='Feature extractor backbone', type=click.Choice(['diffusion', 'acgan']),
               default='diffusion')
 @click.option('--compare_diffusion_gan_pseudo', help='Compare pseudo-label performance of diffusion and ACGAN features',
@@ -1906,7 +1906,7 @@ def generate_sigma_schedule(sigma_min, sigma_max, num_steps, rho):
 @click.option('--acgan_latent_dim', help='ACGAN latent dim (default: auto infer from checkpoint)', type=int, default=None)
 # default='/data/psw/edm/ckpt_mnist/network-snapshot-019344.pkl')
 @click.option('--label_ratio', help='有标签数据的比例', metavar='FLOAT', type=float, default=0.05)
-@click.option('--max_images', help='使用的最大图像数量', metavar='INT', type=int, default=10000)
+@click.option('--max_images', help='使用的最大图像数量', metavar='INT', type=int, default=6000)
 @click.option('--batch_size', help='批处理大小', metavar='INT', type=int, default=64)
 @click.option('--test_sampling', help='是否进行采样测试验证模型', is_flag=True, default=False)
 @click.option('--num_sample', help='是否进行采样测试验证模型', type=int, default=16)
@@ -1934,7 +1934,7 @@ def generate_sigma_schedule(sigma_min, sigma_max, num_steps, rho):
 @click.option('--compare_spectral_pseudo', help='比较 latent 与 spectral 的伪标签效果', is_flag=True, default=False)
 @click.option('--spectral_compare_k', help='谱嵌入构图 kNN 的 k 值', type=int, default=15)
 @click.option('--spectral_compare_tau', help='谱嵌入 RBF tau，<=0 自动估计', type=float, default=0.0)
-@click.option('--spectral_compare_dim', help='谱嵌入维度', type=int, default=16)
+@click.option('--spectral_compare_dim', help='谱嵌入维度', type=int, default=64)
 @click.option('--spectral_compare_keep_first_eigvec', help='谱嵌入时保留第一特征向量', is_flag=True, default=False)
 def main(data, outdir, network_pkl, feature_backbone, compare_diffusion_gan_pseudo, acgan_ckpt, acgan_layer,
          acgan_latent_dim, label_ratio, max_images, batch_size,
