@@ -1,7 +1,7 @@
 import argparse
 import json
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -22,6 +22,8 @@ DEFAULT_FIGURE_WIDTH_CM = 7.2 * CM_PER_INCH
 DEFAULT_FIGURE_HEIGHT_CM = 5.8 * CM_PER_INCH
 DEFAULT_REGION_ALPHA = 0.4
 DEFAULT_REGION_LIGHTEN_RATIO = 0.5
+DEFAULT_AXIS_PADDING_RATIO = 0.01
+NORMALIZED_PLOT_LIMITS = ((-1.02, 1.02), (-1.02, 1.02))
 
 
 def _lighten_rgba(color: Tuple[float, float, float, float], blend_ratio: float) -> Tuple[float, float, float, float]:
@@ -127,11 +129,69 @@ def _apply_auxiliary_artists(
 
     if is_labeled is not None:
         ax.legend(
-        handles=_build_label_state_legend_handles(),
-        loc="upper right",
-        bbox_to_anchor=(0.02, 0.98),
-        borderaxespad=0.0,
+            handles=_build_label_state_legend_handles(),
+            loc="upper right",
+            bbox_to_anchor=(0.02, 0.98),
+            borderaxespad=0.0,
         )
+
+
+
+def compute_axis_limits(
+    embeddings_2d: Iterable[np.ndarray],
+    padding_ratio: float = DEFAULT_AXIS_PADDING_RATIO,
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    xs = []
+    ys = []
+    for embedding_2d in embeddings_2d:
+        if embedding_2d.ndim != 2 or embedding_2d.shape[1] != 2:
+            raise ValueError("Each embedding must have shape [N, 2].")
+        if embedding_2d.shape[0] == 0:
+            continue
+        xs.append(embedding_2d[:, 0])
+        ys.append(embedding_2d[:, 1])
+
+    if not xs:
+        raise ValueError("Need at least one non-empty 2D embedding to compute axis limits.")
+
+    x = np.concatenate(xs)
+    y = np.concatenate(ys)
+    x_min = float(np.min(x))
+    x_max = float(np.max(x))
+    y_min = float(np.min(y))
+    y_max = float(np.max(y))
+    x_span = x_max - x_min
+    y_span = y_max - y_min
+    x_pad = max(x_span * padding_ratio, 1e-6)
+    y_pad = max(y_span * padding_ratio, 1e-6)
+    return (x_min - x_pad, x_max + x_pad), (y_min - y_pad, y_max + y_pad)
+
+
+def normalize_embedding_2d_range(
+    embedding_2d: np.ndarray,
+    target_min: float = -1.0,
+    target_max: float = 1.0,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    if embedding_2d.ndim != 2 or embedding_2d.shape[1] != 2:
+        raise ValueError("embedding_2d must have shape [N, 2].")
+
+    embedding = embedding_2d.astype(np.float32, copy=True)
+    col_min = np.min(embedding, axis=0, keepdims=True)
+    col_max = np.max(embedding, axis=0, keepdims=True)
+    span = col_max - col_min
+    midpoint = (target_min + target_max) / 2.0
+
+    normalized = np.empty_like(embedding, dtype=np.float32)
+    valid_dims = span.reshape(-1) > eps
+    normalized[:, valid_dims] = (
+        (embedding[:, valid_dims] - col_min[:, valid_dims])
+        / span[:, valid_dims]
+        * (target_max - target_min)
+        + target_min
+    )
+    normalized[:, ~valid_dims] = midpoint
+    return normalized
 
 
 def load_feature_pack(input_path: str, metadata_path: Optional[str]) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
@@ -400,19 +460,18 @@ def save_visualization(
     figure_height_cm: float,
     fill_class_regions: bool,
     region_alpha: float,
+    normalize_plot_range: bool = True,
 ):
     unique_labels = np.unique(labels)
     cmap = "tab10" if unique_labels.size <= 10 else "tab20"
     vmin = int(unique_labels.min())
     vmax = int(unique_labels.max())
-    x = embedding_2d[:, 0]
-    y = embedding_2d[:, 1]
-    x_span = float(np.max(x) - np.min(x))
-    y_span = float(np.max(y) - np.min(y))
-    x_pad = max(x_span * 0.01, 1e-6)
-    y_pad = max(y_span * 0.01, 1e-6)
-    x_limits = (float(np.min(x) - x_pad), float(np.max(x) + x_pad))
-    y_limits = (float(np.min(y) - y_pad), float(np.max(y) + y_pad))
+
+    if normalize_plot_range:
+        embedding_2d = normalize_embedding_2d_range(embedding_2d)
+        x_limits, y_limits = NORMALIZED_PLOT_LIMITS
+    else:
+        x_limits, y_limits = compute_axis_limits([embedding_2d])
 
     fig, ax = plt.subplots(
         1,
@@ -460,6 +519,62 @@ def save_visualization(
     fig.tight_layout(pad=0.08)
     fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.01)
     plt.close(fig)
+
+
+def render_existing_outputs(
+    output_dir: str,
+    show_legend: bool,
+    figure_width_cm: float,
+    figure_height_cm: float,
+    fill_class_regions: bool,
+    region_alpha: float,
+    normalize_plot_range: bool,
+):
+    outputs_path = os.path.join(output_dir, "spectral_pipeline_outputs.npz")
+    if not os.path.exists(outputs_path):
+        raise FileNotFoundError(f"Numeric outputs not found: {outputs_path}")
+
+    data = np.load(outputs_path)
+    required_keys = ["labels", "umap_diffusion_2d", "umap_spectral_2d"]
+    missing_keys = [key for key in required_keys if key not in data]
+    if missing_keys:
+        raise KeyError(f"{outputs_path} is missing keys: {', '.join(missing_keys)}")
+
+    labels = data["labels"].astype(np.int64)
+    is_labeled = data["is_labeled"].astype(np.int64) if "is_labeled" in data else None
+    diffusion_umap = data["umap_diffusion_2d"].astype(np.float32)
+    spectral_umap = data["umap_spectral_2d"].astype(np.float32)
+
+    diffusion_fig_path = os.path.join(output_dir, "umap_diffusion.png")
+    spectral_fig_path = os.path.join(output_dir, "umap_spectral.png")
+    save_visualization(
+        embedding_2d=diffusion_umap,
+        labels=labels,
+        is_labeled=is_labeled,
+        title="UMAP of diffusion latent $h_i^{diff}$",
+        out_path=diffusion_fig_path,
+        show_legend=show_legend,
+        figure_width_cm=figure_width_cm,
+        figure_height_cm=figure_height_cm,
+        fill_class_regions=fill_class_regions,
+        region_alpha=region_alpha,
+        normalize_plot_range=normalize_plot_range,
+    )
+    save_visualization(
+        embedding_2d=spectral_umap,
+        labels=labels,
+        is_labeled=is_labeled,
+        title="UMAP of spectral embedding $e_i^{spec}$",
+        out_path=spectral_fig_path,
+        show_legend=show_legend,
+        figure_width_cm=figure_width_cm,
+        figure_height_cm=figure_height_cm,
+        fill_class_regions=fill_class_regions,
+        region_alpha=region_alpha,
+        normalize_plot_range=normalize_plot_range,
+    )
+    print(f"Visualization saved to: {diffusion_fig_path}")
+    print(f"Visualization saved to: {spectral_fig_path}")
 
 
 def save_numeric_outputs(
@@ -510,7 +625,7 @@ def parse_args():
     parser.add_argument(
         "--input",
         type=str,
-        required=True,
+        default="",
         help="Input feature pack .npz, e.g. pseudo_label_output/all_features.npz",
     )
     parser.add_argument(
@@ -579,6 +694,16 @@ def parse_args():
         action="store_true",
         help="Disable plot legends (class colorbar and labeled/unlabeled marker legend).",
     )
+    parser.add_argument(
+        "--render_existing",
+        action="store_true",
+        help="Only redraw plots from output_dir/spectral_pipeline_outputs.npz.",
+    )
+    parser.add_argument(
+        "--no_normalize_plot_range",
+        action="store_true",
+        help="Disable per-plot min-max normalization of UMAP coordinates before drawing.",
+    )
     parser.add_argument("--metric_knn_k", type=int, default=10, help="k for kNN label consistency metric.")
     parser.add_argument("--random_seed", type=int, default=42, help="Random seed.")
     return parser.parse_args()
@@ -587,6 +712,21 @@ def parse_args():
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.render_existing:
+        render_existing_outputs(
+            output_dir=args.output_dir,
+            show_legend=(not args.no_legend),
+            figure_width_cm=args.figure_width_cm,
+            figure_height_cm=args.figure_height_cm,
+            fill_class_regions=args.fill_class_regions,
+            region_alpha=args.region_alpha,
+            normalize_plot_range=(not args.no_normalize_plot_range),
+        )
+        return
+
+    if not args.input:
+        raise ValueError("--input is required unless --render_existing is used.")
 
     print("=== Step 1: Load diffusion latent features ===")
     features, labels, is_labeled = load_feature_pack(
@@ -655,6 +795,7 @@ def main():
         figure_height_cm=args.figure_height_cm,
         fill_class_regions=args.fill_class_regions,
         region_alpha=args.region_alpha,
+        normalize_plot_range=(not args.no_normalize_plot_range),
     )
     save_visualization(
         embedding_2d=spectral_umap,
@@ -667,6 +808,7 @@ def main():
         figure_height_cm=args.figure_height_cm,
         fill_class_regions=args.fill_class_regions,
         region_alpha=args.region_alpha,
+        normalize_plot_range=(not args.no_normalize_plot_range),
     )
     print(f"Visualization saved to: {diffusion_fig_path}")
     print(f"Visualization saved to: {spectral_fig_path}")

@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import warnings
 from typing import Dict, List, Optional, Tuple
 
 import click
@@ -241,18 +242,29 @@ def load_classifier_features(
     if "features" not in pack:
         raise KeyError(f"{classifier_features_npz} must contain key 'features'")
     features = pack["features"].astype(np.float32)
-    if features.shape[0] != expected_num_samples:
-        raise ValueError(
-            f"classifier features sample count mismatch: {features.shape[0]} vs expected {expected_num_samples}"
-        )
+    feature_count = int(features.shape[0])
 
     if "labels" in pack:
         labels = pack["labels"].astype(np.int64)
-        if labels.shape[0] != expected_num_samples:
+        if labels.shape[0] != feature_count:
             raise ValueError(
-                f"classifier labels sample count mismatch: {labels.shape[0]} vs expected {expected_num_samples}"
+                f"classifier labels sample count mismatch: {labels.shape[0]} vs feature count {feature_count}"
+            )
+        if feature_count != expected_num_samples:
+            warnings.warn(
+                "classifier feature count does not match the evaluation split; "
+                "classifier metrics will be computed on the samples stored in the classifier npz.",
+                RuntimeWarning,
+                stacklevel=2,
             )
     else:
+        if feature_count != expected_num_samples:
+            raise ValueError(
+                "classifier features sample count mismatch: "
+                f"{feature_count} vs expected {expected_num_samples}, and no labels were provided in the npz. "
+                "Please include a 'labels' array in the classifier feature file when its sample count differs "
+                "from the evaluation split."
+            )
         labels = fallback_labels.astype(np.int64)
     return features, labels
 
@@ -627,12 +639,12 @@ if __name__ == "__main__":
     main()
 
 '''
-python edm-temp/representation_quality_table.py \
-  --data <数据集路径> \
+python representation_quality_table.py \
+  --data /data/psw/DFLSemi_diffusion/samples/cifar10/cifar-10-python.tar.gz \
   --dataset_type cifar10 \
-  --network_pkl <扩散模型pkl路径> \
+  --network_pkl /data/psw/edm/checkpoint/edm-cifar10-32x32-uncond-vp.pkl \
   --outdir representation_quality_output \
-  --classifier_features_npz 
+  --classifier_features_npz /data/psw/edm/classifier_feature_snapshots/unlabeled_round_0450.npz
 
 
 '''
